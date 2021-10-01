@@ -3,7 +3,8 @@
 *  v0.3 beta  David Fisher 21apr2021
 *  v0.4 beta  David Fisher 07may2021
 *  v0.5 beta  David Fisher 01jul2021
-*! v0.6 beta  David Fisher 12jul2021
+*  v0.6 beta  David Fisher 12jul2021
+*! v0.7 beta  David Fisher 04aug2021
 
 
 *** METAFLOAT ***
@@ -16,6 +17,8 @@
 //         under random-effects, with or without `nouncertainv'
 // v0.6: addition of `design' option; analogous to inconsistency parameters in NMA
 //       observations with extreme variances now set to be augmented
+// v0.7: dataset constructed containing floating subgroups and interactions side-by-side to facilitate "two-panel" forest plots
+//       options saving() and `clear' added
 
 * Syntax:
 // varlist (required) = effect size and std err
@@ -36,73 +39,85 @@
 // `options' = eform options, plus other options to pass to -mvmeta- e.g. tolerance()
 
 
-program define metafloat, eclass sortpreserve
+program define metafloat, eclass
 
 	syntax varlist(numeric min=2 max=2) [if] [in], ///
 		STUDY(varname) SUBGROUP(varname) ///
 		[ FIXED RANDOMBeta EXCHangeable UNStructured SIGMAGamma(string) SIGMABeta(string) ///
-		 TREND2 TREND(string) AUGVARiance(real 1e5) noAUGTRend SHOWmodels noUNCertainv DESign * ]
+		 TREND2 TREND(string) AUGVARiance(real 1e5) noAUGTRend SHOWmodels noUNCertainv DESign ///
+		 SAVING(string) CLEAR * ]
 
-	marksample touse
-	
+	marksample touse	
 	tokenize `varlist'
 	args y stderr
-	
-	cap assert `stderr' >= 0 if `touse'
-	if _rc {
-		nois disp as err "Standard error cannot be negative"
-		exit 198
-	}
-	
+		
 	_get_eformopts, eformopts(`options') allowed(__all__) soptions
 	local eformopt eform(`"`s(str)'"')
 	local soptions `"`s(options)'"'
 
 	
 	** Check for potential conflicts in varnames:
-	// check that varnames do not have prefix _I*
-	foreach x in study subgroup {
+	// check that varnames do not conflict with each other
+	foreach v1 in y stderr study subgroup {
+		foreach v2 in y stderr study subgroup {
+			if `"`v1'"'==`"`v2'"' continue
+			cap assert substr(`"``v1''"', 1, 7) != substr(`"``v2''"', 1, 7)
+			if _rc {
+				nois disp as err `"Variable name conflict"'
+				nois disp as err `"Variables {it:y}, {it:stderr}, {bf:study()} and {bf:subgroup()} must all be distinct"'
+				exit _rc
+			}
+		}
+	}
+	
+	// check that varnames are not called y or V
+	foreach v1 in stderr study subgroup {
+		foreach v2 in y V {
+			cap assert `"``v1''"'!=`"`v2'"'
+			if _rc {
+				nois disp as err `"Variable name conflict"'
+				nois disp as err `"Variables {it:stderr}, {bf:study()} and {bf:subgroup()} must not be named {bf:`v2'}; please rename"'
+				exit _rc
+			}
+		}
+	}
+	cap assert `"`y'"'!="V"
+	if _rc {
+		nois disp as err `"Variable name conflict"'
+		nois disp as err `"Variables {it:y}, {it:stderr}, {bf:study()} and {bf:subgroup()} must not be named {bf:V}; please rename"'
+		exit _rc
+	}
+	
+	// check that varnames do not have prefix _I* (or _Design if applicable)
+	foreach x in y stderr study subgroup {
 		cap assert `"`=substr(`"``x''"', 1, 2)'"'!=`"_I"'
 		if _rc {
-			nois disp as err `"Cannot have {bf:`x'()} variable name beginning with {bf:_I}; please rename this variable"'
+			nois disp as err `"Variable name conflict"'
+			nois disp as err `"Variables {it:y}, {it:stderr}, {bf:study()} and {bf:subgroup()} must not begin with {bf:_I}; please rename"'
+			exit _rc
 		}
 		if "`design'"!="" {
 			cap assert `"`=substr(`"``x''"', 1, 8)'"'!=`"_Design"'
 			if _rc {
-				nois disp as err `"Cannot have {bf:`x'()} variable name beginning with {bf:_Design}; please rename this variable"'
+				nois disp as err `"Variable name conflict"'
+				nois disp as err `"Variables {it:y}, {it:stderr}, {bf:study()} and {bf:subgroup()} must not begin with {bf:_Design}; please rename"'
+				exit _rc
 			}
 		}
 	}
 	
-	// check that varnames are not called _fillin, _Trend, _One, _Zero
-	foreach v1 in study subgroup {
-		foreach v2 in fillin Trend One Zero {
-			cap assert `"``v1''"'!=`"_`v2'"'
+	// check that varnames are not called _fillin, _Trend, _One, _Zero	
+	foreach v1 in y stderr study subgroup {
+		foreach v2 in _fillin _Trend _One _Zero {
+			cap assert `"``v1''"'!=`"`v2'"'
 			if _rc {
-				nois disp as err `"Cannot have {bf:`v1'()} variable name equal to {bf:_`v2'}; please rename this variable"'
+				nois disp as err `"Variable name conflict"'
+				nois disp as err `"Variables {it:y}, {it:stderr}, {bf:study()} and {bf:subgroup()} must not be named {bf:`v2'}; please rename"'
+				exit _rc
 			}
 		}
 	}
-	
-	// find number of subgroups
-	qui tab `subgroup' if `touse'
-	local k = r(r)	
-	local k1 = `k' - 1
 
-	// find number of studies
-	qui tab `study' if `touse'
-	local t = r(r)
-	
-	// check that study-subgroup combinations are unique
-	tempvar Ngroup
-	qui bysort `touse' `study' `subgroup' (`obs') : gen int `Ngroup' = _N
-	summ `Ngroup' if `touse', meanonly
-	if r(max) > 1 {
-		nois disp as err "The following combination(s) of study and subgroup are not unique:"
-		nois list `study' `subgroup' `y' `stderr' if `Ngroup' > 1 & `touse'
-		exit 198
-	}
-	
 	// setup fixed/random and covariance structures
 	opts_exclusive `"`fixed' `randombeta' `exchangeable' `unstructured'"' `""' 184
 	local structure `fixed'`randombeta'`exchangeable'`unstructured'
@@ -111,7 +126,7 @@ program define metafloat, eclass sortpreserve
 		    nois disp as err `"Covariance structure {bf:`structure'} specified; options {bf:sigmagamma()} and {bf:sigmabeta()} are invalid"'
 			exit 198
 		}
-	}
+	}	
 	
 	
 	** Preserve data, prior to editing
@@ -119,19 +134,48 @@ program define metafloat, eclass sortpreserve
 
 	qui keep if `touse' & !missing(`study', `subgroup')
 	keep `y' `stderr' `study' `subgroup'
+		
+	cap assert `stderr' >= 0
+	if _rc {
+		nois disp as err "Standard error cannot be negative"
+		exit 198
+	}
+
+	// find number of subgroups
+	qui tab `subgroup'
+	local k = r(r)	
+	local k1 = `k' - 1
+	cap confirm string variable `subgroup'
+	if !_rc local string string
+	
+	// find number of studies
+	qui tab `study'
+	local t = r(r)
+	
+	// check that study-subgroup combinations are unique
+	tempvar Ngroup
+	qui bysort `study' `subgroup' (`obs') : gen int `Ngroup' = _N
+	summ `Ngroup', meanonly
+	if r(max) > 1 {
+		nois disp as err "The following combination(s) of study and subgroup are not unique:"
+		nois list `study' `subgroup' `y' `stderr' if `Ngroup' > 1
+		exit 198
+	}
 	
 	tempvar V
 	qui gen double `V' = `stderr'^2				// Generate estimate of the variance (s-squared)
 	drop `stderr'
+	qui rename `y' y		// There should not be conflicts here, due to earlier checking
+	qui rename `V' V
 	
 	// augment if missing subgroup data
 	qui fillin `study' `subgroup'
-	assert _fillin == missing(`y')
+	assert _fillin == missing(y)
 	
 	// if any observed variances are larger than `augvariance'
 	//  (e.g. if estimated from very small sample)
 	// also set to _fillin
-	qui replace _fillin = 1 if `V' > `augvariance'
+	qui replace _fillin = 1 if V > `augvariance'
 
 	summ _fillin, meanonly
 	if r(sum) {
@@ -139,16 +183,16 @@ program define metafloat, eclass sortpreserve
 		nois disp as text " and will be given augmented variances of " as res `augvariance' as text ":"
 		list `study' `subgroup' if _fillin
 	}
-	qui replace `V' = `augvariance' if _fillin
-	qui replace `y' = 0 if _fillin
+	qui replace V = `augvariance' if _fillin
+	qui replace y = 0 if _fillin
 
 	// obtain "design", i.e. which subgroups are present
+	qui levelsof `study', local(slist)
 	if "`design'"!="" {
 	    
 		// `subgroup' must either be numeric, or single-character string
-		cap confirm numeric variable `subgroup'
-		if _rc {
-		    tempvar lensub
+		if `"`string'"'!=`"""' {
+			tempvar lensub
 			gen `lensub' = length("`subgroup'")
 			summ `lensub', meanonly
 			if r(max) > 1 {
@@ -158,7 +202,6 @@ program define metafloat, eclass sortpreserve
 		}
 		
 		qui gen _Design = ""
-		qui levelsof `study', local(slist)
 		foreach s of local slist {
 			cap confirm string variable `study'
 			if _rc {
@@ -180,30 +223,90 @@ program define metafloat, eclass sortpreserve
 	cap drop _I*
 	xi, noomit i.`subgroup'
 	qui ds _I*
-	local colnames `"`r(varlist)'"'
+	local _Inames `"`r(varlist)'"'
+
+	xi, prefix(_Int) i.`subgroup'
+	qui ds _Int*
+	local _Intnames `"`r(varlist)'"'
+	cap drop _I*
+	
+	local subgroup7 = substr(`"`subgroup'"', 1, 7)
+	if `"`string'"'!=`"""' {
+		tempname sglab
+		local i = 1
+		foreach x of local sgvals {
+			local _Intnames _Int`subgroup7'_`x'
+			label define `sglab' `i' "`x'", add
+			local ++i
+		}
+		tempvar sgstr
+		rename `subgroup' `sgstr'
+		encode `sgstr', gen(`subgroup') label(`sglab') 
+	}
+	
+	/*
+	if `"`string'"'==`"""' {
+		cap drop _I*
+		xi, noomit i.`subgroup'
+		qui ds _I*
+		local _Inames `"`r(varlist)'"'
+		drop _I*
+	}
+	else {
+		local subgroup7 = substr(`"`subgroup'"', 1, 7)
+		local _Intnames
+		tempname sglab
+		local i = 1
+		foreach x of local sgvals {
+			local _Intnames _Int`subgroup7'_`x'
+			label define `sglab' `i' "`x'", add
+			local ++i
+		}
+		tempvar sgstr
+		rename `subgroup' `sgstr'
+		encode `sgstr', gen(`subgroup') label(`sglab') 
+	}
+	*/
 	
 	qui levelsof `subgroup', local(sgvals)
-	cap assert `: word count `sgvals''==`: word count `colnames''
+	cap {
+		assert `: word count `sgvals'' == `k'
+		assert `: word count `_Inames'' == `k'
+		assert `: word count `_Intnames'' == `k1'
+	}
 	if _rc {
 		nois disp as err `"Error in identification of subgroups"'
 		exit 198
 	}	
-	
+
 	// identify reference subgroup
 	tempname T
 	if `"`: char `subgroup'[omit]'"'==`""' {
-	    local ref : word 1 of `sgvals'
-		local r = 1
+	    local ref : word 1 of `sgvals'		
 		matrix define `T' = I(`k')
+		gettoken ref sgvals2 : sgvals
+		local sgvals2 = trim(`"`sgvals2'"')		// gettoken leaves an extra initial space for some reason
+
+		if `"`string'"'!=`""' {
+			qui numlist "1(1)`k'"
+			local sgvals2string `"`r(numlist)'"'
+			gettoken r sgvals2string : sgvals2string
+			local sgvals2string = trim(`"`sgvals2string'"')		// gettoken leaves an extra initial space for some reason
+		}
 	}
 	
 	// ... and generate transformation matrix if reference is not first subgroup
 	else {
 	    local ref : char `subgroup'[omit]
-	    qui ds _I*_`ref'
-		assert `: word count `r(varlist)''==1
 		local r : list posof `"`ref'"' in sgvals
+		local sgvals2 : list sgvals - ref
 
+		if `"`string'"'!=`""' {
+			qui numlist "1(1)`k'"
+			local sgvals2string `"`r(numlist)'"'
+			local sgvals2string : list sgvals2string - r
+		}
+	
 		if `r'==1 {
 			matrix define `T' = I(`k')
 		}
@@ -233,10 +336,10 @@ program define metafloat, eclass sortpreserve
 		
 		cap confirm string variable `study'
 		if _rc {	
-			mkmat `V' if `study'==`s', matrix(`W`i'')
+			mkmat V if `study'==`s', matrix(`W`i'')
 		}
 		else {
-			mkmat `V' if `study'==`"`s'"', matrix(`W`i'')			
+			mkmat V if `study'==`"`s'"', matrix(`W`i'')			
 		}
 		
 		cap assert rowsof(`W`i'')==`k'
@@ -308,12 +411,22 @@ program define metafloat, eclass sortpreserve
 			matrix define `d' = `M' * `T' * `d'
 		}
 	}
+
+	if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
+		tempfile main_effects
+		qui save `main_effects'
+	}
 	
 	// generate contrasts (use prefix "_Int" = "interaction")
 	// Note: _y_cons is thereference subgroup (i.e NOT a contrast)
-	qui xi, prefix(_Int) : mvmeta_make regress `y' i.`subgroup' [iw=`V'^-1], mse1 by(`study') `design_opt' clear nodetails useconstant
+	qui xi, prefix(_Int) : mvmeta_make regress y i.`subgroup' [iw=V^-1], mse1 by(`study') `design_opt' clear nodetails useconstant
 	// N.B. regress ... [iw], mse1  is equivalent to using -vwls- 
 	//  but currently -mvmeta_make- and -vwls- don't like each other for some reason
+	
+	if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
+		tempfile interactions
+		qui save `interactions'
+	}
 	
 	
 	** STEP 1: ESTIMATE INTERACTION (MEAN AND BS VARIANCE)
@@ -407,20 +520,44 @@ program define metafloat, eclass sortpreserve
 			tempname Chol
 			matrix define `Chol' = e(b)[1, `k'...]
 		}
-	
+
+		/*
 		local colnames_eV : colnames e(V)
 		local colnames_eb : colnames e(b)
 		local rownames_eb : rownames e(b)
 		
+		local colnames_eV2
+		local colnames_eb2
+		local testnames
 		forvalues i = 1 / `k1' {
+			// these lists should be in the format: y_Int[subgroup]_[value]
+			// check this now, as we may need to manipulate these later for saved dataset
+			local el : word `i' of `colnames_eV'
+			tokenize `el', parse("_")
+			local testnames `testnames' `5'
+			
 			local colnames_eV2 `colnames_eV2' `: word `i' of `colnames_eV''
 			local colnames_eb2 `colnames_eb2' `: word `i' of `colnames_eb''
+		}
+
+		if `"`sgvals2_num'"'!=`""' local ext _num
+		cap assert `"`testnames'"'==`"`sgvals2`ext''"'
+		if _rc {
+			nois disp as err "Error in colnames [NEED TO IMPROVE THIS MESSAGE]"
+			exit _rc
 		}
 		
 		matname `VarGammaHat' `colnames_eV2', explicit
 		matname `SigmaGamma'  `colnames_eV2', explicit
 		matrix colnames `GammaHat' = `: word 1 of `rownames_eb''
 		matrix rownames `GammaHat' = `colnames_eb2'
+		*/
+
+		matname `VarGammaHat' `_Intnames', explicit
+		matname `SigmaGamma'  `_Intnames', explicit
+		matrix rownames `GammaHat' = `_Intnames'
+		local rownames_eb : rownames e(b)
+		matrix colnames `GammaHat' = `: word 1 of `rownames_eb''
 	}
 
 	
@@ -514,7 +651,8 @@ program define metafloat, eclass sortpreserve
 	}
 	matrix define `Grad' = -`VarThetaHat'*`GradSum'
 	matrix rownames `Grad' = `: word 1 of `rownames_eb''
-	matrix colnames `Grad' = `colnames_eb2'
+	// matrix colnames `Grad' = `colnames_eb2'
+	matrix colnames `Grad' = `_Intnames'
 	
 	// now correct VarThetaHat for uncertainty in the heterogeneity matrix, if requested
 	if `"`uncertainv'"'==`""' {
@@ -533,14 +671,171 @@ program define metafloat, eclass sortpreserve
 	// ...also applies to SigmaBeta
 	matrix define `SigmaBeta' = `T''*`SigmaBeta'*`T'
 	matrix coleq `SigmaBeta' = ""
-	matname `SigmaBeta' `colnames', explicit
+	// matname `SigmaBeta' `bcolnames', explicit
+	matname `SigmaBeta' `_Inames', explicit
 	
 	// collect and display under "ereturn"
 	matrix define `BetaHat' = `BetaHat''
 	matrix coleq `BetaHat' = ""
-	matname `BetaHat'    `colnames', columns(.) explicit
-	matname `VarBetaHat' `colnames', explicit
+	// matname `BetaHat'    `bcolnames', columns(.) explicit
+	// matname `VarBetaHat' `bcolnames', explicit
+	matname `BetaHat'    `_Inames', columns(.) explicit
+	matname `VarBetaHat' `_Inames', explicit
 
+	
+	*** Construct saved dataset
+	if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
+		
+		// store pooled estimates
+		tempfile pooled_main pooled_ints
+		tempname BetaTable GammaTable
+		mat `GammaTable' = `GammaHat', vecdiag(`VarGammaHat')'
+		matrix rownames `GammaTable' = `sgvals2'
+		qui metani `GammaTable', variances nograph nooverall rownames rowtitle(Pooled estimates) ///
+			saving(`pooled_ints', stacklabel)
+
+		mat `BetaTable' = `BetaHat'', vecdiag(`VarBetaHat')'
+		matrix rownames `BetaTable' = `sgvals'
+		qui metani `BetaTable', variances nograph nooverall rownames rowtitle(Pooled estimates) ///
+			saving(`pooled_main', stacklabel)
+
+		qui use `pooled_main', clear
+		foreach x of varlist _ES _seES _LCI _UCI _WT {
+			qui rename `x' _y`x'
+		}
+		qui merge 1:1 _LABELS using `pooled_ints'
+		list, nol
+		cap {
+			assert _merge==1 if _LABELS=="`ref'"
+			assert _merge==3 if _LABELS!="`ref'"
+		}
+		if _rc {
+			nois disp as err "Error in colnames [NEED TO IMPROVE THIS MESSAGE]"
+			exit _rc
+		}
+		drop _merge _EFFECT
+		foreach x of varlist _ES _seES _LCI _UCI _WT {
+			qui rename `x' _yInt`x'
+		}
+		
+		sort _USE _STUDY		// shouldn't need this!! check -metan- stacklabel option
+		// also at this point need to replace _STUDY with something else
+		// currently it contains values 1, 2, 3, ... by default
+		// need to replace with same values as in other `filename' datasets
+		// but how best to find out what those values are??
+		
+		qui replace _USE = 5 if inlist(_USE, 1, 2)
+		qui save `pooled_main', replace
+		
+		
+		// merge subgroup estimates and interaction estimates into a single dataset
+		qui use `interactions', clear
+		qui ds *_cons*
+		local vlist `"`r(varlist)'"'
+		
+		if `"`string'"'!=`""' local refr `r'
+		else local ref2 `ref'
+		// ^^ REVISIT/SIMPLIFY
+		
+		local subgroup2 = substr(`"`subgroup'"', 1, 7)	// REVISIT
+		foreach v of local vlist {
+			local newname = subinstr(`"`v'"', `"_cons"', `"_Int`subgroup2'_`refr'"', .)
+			qui rename `v' `newname'
+		}
+		foreach x of local sgvals2`string' {		// <-- REVISIT/SIMPLIFY
+			local rsvlist `rsvlist' S_Int`subgroup2'_@_Int`subgroup2'_`x'
+		}
+		
+
+		desc, fullnames
+		/*qui*/ reshape long y_Int`subgroup2'_ `rsvlist', i(`study') j(`subgroup2')
+		
+		rename `subgroup2' `subgroup'		// REVISIT
+
+		desc `subgroup'
+		tab `subgroup', nol
+		
+		qui merge 1:1 `study' `subgroup' using `main_effects', assert(match) nogen
+
+		qui gen double S_Int`subgroup7'_ = .
+		order S_Int`subgroup7'_, after(y_Int`subgroup7'_)
+		foreach x of local sgvals {
+			if `x'==`ref' continue
+			/*
+			if `"`string'"'!=`""' {
+				qui replace S_Int`subgroup7'_ = S_Int`subgroup7'__Int`subgroup7'_`x' if `subgroup'==`"`x'"'
+			}
+			else {
+			*/
+				qui replace S_Int`subgroup7'_ = S_Int`subgroup7'__Int`subgroup7'_`x' if `subgroup'==`x'
+			// }
+			drop S_Int`subgroup7'__Int`subgroup7'_`x'
+		}
+		/*
+		if `"`string'"'!=`""' {
+			qui replace y_Int`subgroup'_ = .  if `subgroup'==`"`ref'"'
+			qui replace S_Int`subgroup'_ = .  if `subgroup'==`"`ref'"'
+		}
+		else {
+		*/
+			qui replace y_Int`subgroup7'_ = .  if `subgroup'==`ref'
+			qui replace S_Int`subgroup7'_ = .  if `subgroup'==`ref'
+		// }
+		qui rename y_Int`subgroup7'_ _yInt_ES
+		qui replace _yInt_ES = . if S_Int`subgroup7'_ >= `augvariance'
+		qui gen double _yInt_seES = sqrt(S_Int`subgroup7'_) if S_Int`subgroup7'_ < `augvariance'
+		drop S_Int`subgroup7'_
+		
+		// use -metan- to restructure the main effects
+		qui replace y = . if V >= `augvariance'
+		qui gen double stderr = sqrt(V) if V < `augvariance'
+		qui metan y stderr, nograph nohet nosubgroup nooverall keeporder clear ///
+			study(`subgroup') by(`study') rcols(_yInt_ES _yInt_seES)
+		qui drop _EFFECT
+		foreach x of varlist _ES _seES _LCI _UCI _WT {
+			qui rename `x' _y`x'
+		}
+
+		qui gen double _yInt_LCI = _yInt_ES - invnormal(.975)*_yInt_seES
+		qui gen double _yInt_UCI = _yInt_ES + invnormal(.975)*_yInt_seES
+		qui gen double _yInt_WT = 1/_yInt_seES^2 if _USE!=5
+		summ _yInt_WT, meanonly
+		qui replace _yInt_WT = 100*_yInt_WT / r(sum)
+				
+		// append subgroup estimates
+		// ... and "correct" the contents of _STUDY (see above)
+		tempvar pooled obs
+		qui append using `pooled_main', gen(`pooled')
+		qui gen int `obs' = _n
+		forvalues i = 1 / `k' {
+			summ `obs' if _STUDY==`i' & `pooled', meanonly
+			local labi = _LABELS[`r(min)']
+			summ `obs' if _LABELS==`"`labi'"' & !`pooled', meanonly
+			local studyi = _STUDY[`r(min)']
+			qui replace _STUDY = `studyi' if `pooled' & _STUDY==`i'
+		}
+		drop `pooled' `obs'
+		
+		qui rename _USE _y_USE
+		order _y_USE, before(_y_ES)
+		qui gen byte _yInt_USE = _y_USE
+		qui replace _yInt_USE = 9 if _LABELS=="`ref'"
+		qui replace _yInt_USE = 2 if _yInt_USE==1 & missing(_yInt_seES)
+		order _yInt_USE, before(_yInt_ES)
+
+		qui compress
+		
+		if `"`saving'"'!=`""' {
+			_prefix_saving `saving'
+			qui save `s(filename)', `s(replace)'
+		}
+		if `"`clear'"'!=`""' {
+			restore, not
+		}
+	}
+	
+	
+	*** Finally, present the results
 	ereturn post `BetaHat' `VarBetaHat', depname(Subgroup)
 	ereturn matrix GammaHat    = `GammaHat'
 	ereturn matrix VarGammaHat = `VarGammaHat'
@@ -554,5 +849,5 @@ program define metafloat, eclass sortpreserve
 	
 	nois disp as text _n "Floating subgroups:"
 	ereturn display, `eformopt'
-
+	
 end
