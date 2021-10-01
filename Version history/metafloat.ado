@@ -4,7 +4,8 @@
 *  v0.4 beta  David Fisher 07may2021
 *  v0.5 beta  David Fisher 01jul2021
 *  v0.6 beta  David Fisher 12jul2021
-*! v0.7 beta  David Fisher 04aug2021
+*  v0.7 beta  David Fisher 04aug2021
+*! v0.8 beta  David Fisher 20sep2021
 
 
 *** METAFLOAT ***
@@ -19,14 +20,19 @@
 //       observations with extreme variances now set to be augmented
 // v0.7: dataset constructed containing floating subgroups and interactions side-by-side to facilitate "two-panel" forest plots
 //       options saving() and `clear' added
+// v0.8: finalizing random-effects options, particularly "randombeta" and "exchangeable"
 
 * Syntax:
 // varlist (required) = effect size and std err
 // study, subgroup (required) = study & subgroup identifiers
 
-// default (no options) = unstructured random-effects
 // fixed = all fixed (common) effects
-// sigmagamma, sigmabeta = specify structures
+// randombeta = common-effects on SigmaGamma; constant within and between-subgroup heterogeneity for SigmaBeta
+// exchangeable = exchangeable (single-parameter) structures for both SigmaGamma and SigmaBeta
+// default (no options) = unstructured random-effects for both SigmaGamma and SigmaBeta
+// naive = unstructured random-effects for both SigmaGamma and SigmaBeta, removing the constraint that they be related via the `M' matrix
+// sigmagamma, sigmabeta = manually specify structures
+
 // trend = test for linear trend across subgroups (if applicable);
 //         note: presented subgroup estimates do *not* assume linear trend (i.e. trend is only *tested for*, not implemented)
 //         note: actual internal option name is `trend2'
@@ -41,9 +47,28 @@
 
 program define metafloat, eclass
 
+	version 11.0
+	local version : di "version " string(_caller()) ":"
+	* NOTE: mata requires v9.x
+	* factor variable syntax requires 11.0
+
+	// Check that -metan- v4.0+ is installed
+	cap metan
+	if "`r(metan_version)'"=="" {
+		nois disp as err "This program requires {bf:metan} version 4.04 or higher"
+		exit 499
+	}
+	else {
+		local current_version = 4.04
+		if `r(metan_version)' < `current_version' {
+			nois disp as err "This program requires {bf:metan} version 4.04 or higher"
+			exit 499
+		}
+	}
+	
 	syntax varlist(numeric min=2 max=2) [if] [in], ///
 		STUDY(varname) SUBGROUP(varname) ///
-		[ FIXED RANDOMBeta EXCHangeable UNStructured SIGMAGamma(string) SIGMABeta(string) ///
+		[ FIXED RANDOMBeta EXCHangeable UNSTRuctured SIGMAGamma(string) SIGMABeta(string) NAIVE LISTConstraints CONSTRaints(numlist integer) ///
 		 TREND2 TREND(string) AUGVARiance(real 1e5) noAUGTRend SHOWmodels noUNCertainv DESign ///
 		 SAVING(string) CLEAR * ]
 
@@ -118,17 +143,30 @@ program define metafloat, eclass
 		}
 	}
 
-	// setup fixed/random and covariance structures
+	// covariance structure options
 	opts_exclusive `"`fixed' `randombeta' `exchangeable' `unstructured'"' `""' 184
 	local structure `fixed'`randombeta'`exchangeable'`unstructured'
-	if "`structure'"!="" {
-	    if "`sigmagamma'`sigmabeta'"!="" {
-		    nois disp as err `"Covariance structure {bf:`structure'} specified; options {bf:sigmagamma()} and {bf:sigmabeta()} are invalid"'
+	if "`sigmagamma'`sigmabeta'"!="" {
+	    if "`structure'"!="" {
+			nois disp as err `"Covariance structure {bf:`structure'} specified; options {bf:sigmagamma()} and {bf:sigmabeta()} are invalid"'
 			exit 198
 		}
-	}	
-	
-	
+		local structure user
+		if "`sigmagamma'"!="" & "`sigmagamma'"!="fixed" local sigmagamma `"bscov(`sigmagamma')"'
+		if "`sigmabeta'"!="" & "`sigmabeta'"!="fixed" local sigmabeta `"bscov(`sigmabeta')"'
+	}
+	else if "`structure'"=="" local structure unstructured
+
+	if "`structure'"!="unstructured" & "`naive'"!="" {
+		nois disp as err `"Option {bf:naive} is only valid with {bf:unstructured} covariance structure"'
+		exit 198
+	}
+	if "`sigmabeta'"!="" & "`constraints'"!="" {
+		nois disp as err `"Option {bf:contraints()} is only valid with option {bf:sigmabeta()}"'
+		exit 198
+	}
+
+		
 	** Preserve data, prior to editing
 	preserve
 
@@ -165,8 +203,12 @@ program define metafloat, eclass
 	tempvar V
 	qui gen double `V' = `stderr'^2				// Generate estimate of the variance (s-squared)
 	drop `stderr'
-	qui rename `y' y		// There should not be conflicts here, due to earlier checking
-	qui rename `V' V
+	if `"`y'"'!=`"y"' {
+		qui rename `y' y		// There should not be conflicts here, due to earlier checking
+	}
+	if `"`V'"'!=`"V"' {
+		qui rename `V' V
+	}
 	
 	// augment if missing subgroup data
 	qui fillin `study' `subgroup'
@@ -191,9 +233,9 @@ program define metafloat, eclass
 	if "`design'"!="" {
 	    
 		// `subgroup' must either be numeric, or single-character string
-		if `"`string'"'!=`"""' {
+		if `"`string'"'!=`""' {
 			tempvar lensub
-			gen `lensub' = length("`subgroup'")
+			gen `lensub' = length(`subgroup')
 			summ `lensub', meanonly
 			if r(max) > 1 {
 			    nois disp as err "With option {bf:design}, variable {bf:subgroup()} must be either numeric, or use single string characters only"
@@ -228,45 +270,7 @@ program define metafloat, eclass
 	xi, prefix(_Int) i.`subgroup'
 	qui ds _Int*
 	local _Intnames `"`r(varlist)'"'
-	cap drop _I*
-	
-	local subgroup7 = substr(`"`subgroup'"', 1, 7)
-	if `"`string'"'!=`"""' {
-		tempname sglab
-		local i = 1
-		foreach x of local sgvals {
-			local _Intnames _Int`subgroup7'_`x'
-			label define `sglab' `i' "`x'", add
-			local ++i
-		}
-		tempvar sgstr
-		rename `subgroup' `sgstr'
-		encode `sgstr', gen(`subgroup') label(`sglab') 
-	}
-	
-	/*
-	if `"`string'"'==`"""' {
-		cap drop _I*
-		xi, noomit i.`subgroup'
-		qui ds _I*
-		local _Inames `"`r(varlist)'"'
-		drop _I*
-	}
-	else {
-		local subgroup7 = substr(`"`subgroup'"', 1, 7)
-		local _Intnames
-		tempname sglab
-		local i = 1
-		foreach x of local sgvals {
-			local _Intnames _Int`subgroup7'_`x'
-			label define `sglab' `i' "`x'", add
-			local ++i
-		}
-		tempvar sgstr
-		rename `subgroup' `sgstr'
-		encode `sgstr', gen(`subgroup') label(`sglab') 
-	}
-	*/
+	cap drop _I*	
 	
 	qui levelsof `subgroup', local(sgvals)
 	cap {
@@ -277,36 +281,19 @@ program define metafloat, eclass
 	if _rc {
 		nois disp as err `"Error in identification of subgroups"'
 		exit 198
-	}	
-
-	// identify reference subgroup
+	}
+		
+	
+	** Generate transformation matrix based on choice of reference subgroup
 	tempname T
 	if `"`: char `subgroup'[omit]'"'==`""' {
-	    local ref : word 1 of `sgvals'		
+	    local r = 1
+	    gettoken ref sgvals2 : sgvals
 		matrix define `T' = I(`k')
-		gettoken ref sgvals2 : sgvals
-		local sgvals2 = trim(`"`sgvals2'"')		// gettoken leaves an extra initial space for some reason
-
-		if `"`string'"'!=`""' {
-			qui numlist "1(1)`k'"
-			local sgvals2string `"`r(numlist)'"'
-			gettoken r sgvals2string : sgvals2string
-			local sgvals2string = trim(`"`sgvals2string'"')		// gettoken leaves an extra initial space for some reason
-		}
 	}
-	
-	// ... and generate transformation matrix if reference is not first subgroup
 	else {
 	    local ref : char `subgroup'[omit]
-		local r : list posof `"`ref'"' in sgvals
-		local sgvals2 : list sgvals - ref
-
-		if `"`string'"'!=`""' {
-			qui numlist "1(1)`k'"
-			local sgvals2string `"`r(numlist)'"'
-			local sgvals2string : list sgvals2string - r
-		}
-	
+		local r : list posof `"`ref'"' in sgvals	
 		if `r'==1 {
 			matrix define `T' = I(`k')
 		}
@@ -325,7 +312,7 @@ program define metafloat, eclass
 			}
 		}
 	}
-	
+
 	// store Wi matrices, for later
 	// (with transformation applied)
 	qui levelsof `study', local(slist)
@@ -413,6 +400,28 @@ program define metafloat, eclass
 	}
 
 	if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
+		local sgvals2 : list sgvals - ref
+
+		tempname sglab
+		if `"`string'"'!=`""' {
+			local i = 1
+			foreach x of local sgvals {
+				label define `sglab' `i' "`x'", add
+				local ++i
+			}
+			tempvar subgroup2
+			encode `subgroup', gen(`subgroup2') label(`sglab')
+			
+			qui numlist "1(1)`k'"
+			local sgvals2string `"`r(numlist)'"'
+			local sgvals2string : list sgvals2string - r
+		}
+		else {
+			local sglab : value label `subgroup'
+		}
+		tempfile sglabfile
+		qui label save `sglab' using `sglabfile'
+		
 		tempfile main_effects
 		qui save `main_effects'
 	}
@@ -427,11 +436,15 @@ program define metafloat, eclass
 		tempfile interactions
 		qui save `interactions'
 	}
-	
+
 	
 	** STEP 1: ESTIMATE INTERACTION (MEAN AND BS VARIANCE)
 	if "`showmodels'"=="" local quietly quietly
 
+	if inlist("`structure'", "fixed", "randombeta") local sigmagamma fixed
+	else if "`structure'"=="exchangeable" local sigmagamma bscov(exchangeable .5)
+	else if `"`sigmagamma'"'==`""' local sigmagamma bscov(unstructured)
+	
 	tempname VarGammaHat GammaHat SigmaGamma
 	if `"`trend'`trend2'"'!=`""' {
 		local eq
@@ -470,7 +483,7 @@ program define metafloat, eclass
 		}
 		
 		nois disp as text _n "Test for trend:"
-		`quietly' mvmeta y S, vars(y_Int*) `fixed' `sigmagamma' commonparm nocons eq(`eq') `soptions'
+		`quietly' mvmeta y S, vars(y_Int*) `sigmagamma' commonparm nocons eq(`eq') `soptions' `eformopt'
 		test _Trend1
 
 		if "`augtrend'"!="" {
@@ -496,7 +509,10 @@ program define metafloat, eclass
 		
 		// if `trend2' , *test* for (linear) trend only;  now re-fit as standard model assuming no trend
 		else {
-			`quietly' mvmeta y S, vars(y_Int*) `fixed' `sigmagamma' `soptions'
+			nois disp as text _n "Test of interaction(s):"
+			`quietly' mvmeta y S, vars(y_Int*) `sigmagamma' `soptions' `eformopt'
+			nois testparm y*
+
 			matrix define `VarGammaHat' = e(V)[1..`k1', 1..`k1']
 			matrix define `GammaHat'    = e(b)[1,       1..`k1']'
 			matrix define `SigmaGamma'  = e(Sigma)
@@ -506,53 +522,47 @@ program define metafloat, eclass
 	// default: test for individual contrasts
 	else {
 		nois disp as text _n "Test of interaction(s):"
-		`quietly' mvmeta y S, vars(y_Int*) `fixed' `sigmagamma' `soptions'
+		`quietly' mvmeta y S, vars(y_Int*) `sigmagamma' `soptions' `eformopt'
 		nois testparm y*
 
 		matrix define `VarGammaHat' = e(V)[1..`k1', 1..`k1']
 		matrix define `GammaHat'    = e(b)[1,       1..`k1']'		
 		matrix define `SigmaGamma'  = e(Sigma)
+
+		// REVISIT: WHY NOT JUST e(V) and e(b) AND LEAVE THEM ALONE?  (e.g. row/colnames) ??
 	}
 	
 	// DF: revisit this bit; what to do if we *do* have `trend' ??
 	if `"`trend'"'==`""' {		
 		if `"`fixed'"'==`""' {
 			tempname Chol
-			matrix define `Chol' = e(b)[1, `k'...]
-		}
-
-		/*
-		local colnames_eV : colnames e(V)
-		local colnames_eb : colnames e(b)
-		local rownames_eb : rownames e(b)
-		
-		local colnames_eV2
-		local colnames_eb2
-		local testnames
-		forvalues i = 1 / `k1' {
-			// these lists should be in the format: y_Int[subgroup]_[value]
-			// check this now, as we may need to manipulate these later for saved dataset
-			local el : word `i' of `colnames_eV'
-			tokenize `el', parse("_")
-			local testnames `testnames' `5'
 			
-			local colnames_eV2 `colnames_eV2' `: word `i' of `colnames_eV''
-			local colnames_eb2 `colnames_eb2' `: word `i' of `colnames_eb''
-		}
-
-		if `"`sgvals2_num'"'!=`""' local ext _num
-		cap assert `"`testnames'"'==`"`sgvals2`ext''"'
-		if _rc {
-			nois disp as err "Error in colnames [NEED TO IMPROVE THIS MESSAGE]"
-			exit _rc
+			if "`sigmagamma'"=="fixed" {
+				matrix define `Chol' = J(`k1', `k1', 0)
+			}
+			
+			else if "`structure'"=="exchangeable" {
+				local tau = e(b)[1, `k']
+				matrix define `Chol' = sign(`tau') * cholesky(`SigmaGamma')
+			}
+			
+			// special case: if `unstructured', -mvmeta- outputs the elements of `Chol' as part of e(b)
+			// so don't bother packing them up into a matrix; we're only going to unpack them again later
+			else if "`structure'"=="unstructured" {
+				matrix define `Chol' = e(b)[1, `k'...]
+				/*
+			    local c = `k'
+				matrix define `Chol' = J(`k1', `k1', 0)
+				forvalues i = 1 / `k1' {
+					forvalues j = 1 / `i' {
+						matrix `Chol'[`i', `j'] = e(b)[1, `c']
+						local ++c
+					}
+				}
+				*/
+			}
 		}
 		
-		matname `VarGammaHat' `colnames_eV2', explicit
-		matname `SigmaGamma'  `colnames_eV2', explicit
-		matrix colnames `GammaHat' = `: word 1 of `rownames_eb''
-		matrix rownames `GammaHat' = `colnames_eb2'
-		*/
-
 		matname `VarGammaHat' `_Intnames', explicit
 		matname `SigmaGamma'  `_Intnames', explicit
 		matrix rownames `GammaHat' = `_Intnames'
@@ -560,7 +570,8 @@ program define metafloat, eclass
 		matrix colnames `GammaHat' = `: word 1 of `rownames_eb''
 	}
 
-	
+
+
 	** STEP 2: ESTIMATE TREATMENT EFFECT IN REF GROUP (MEAN, BS VARIANCE AND BS CORRELATION WITH INTERACTIONS)
 	// subtract within-trial interactions from observed interaction data
 	// set up equations that make shifted interactions have mean zero
@@ -583,7 +594,7 @@ program define metafloat, eclass
 		}
 		drop _Design1
 	}		
-		
+	
 	local eq
 	local i = 0
 	tokenize `e(yvars)'
@@ -591,33 +602,72 @@ program define metafloat, eclass
 	    local ++i
 		qui replace `1' = `1' - `GammaHat'[`i', 1]
 		local eq `eq' `1':_Zero `designvars',
-		// local eq `eq' `1':_Zero,
 		macro shift
 	}	
 	local eq eq(`eq' y_cons:_One `designvars')
-	// local eq eq(`eq' y_cons:_One `designvars')
 	
 	cap assert `i'==`k'-1
 	if _rc {
 		nois disp as err "Error detected when subtracting contrasts from non-reference subgroup"
 		exit 198
 	}
+
+	// set up structure of sigmabeta
+	if "`structure'"=="fixed" local sigmabeta fixed
+	else if "`structure'"=="randombeta" {
+		tempname propU
+		matrix define `propU' = J(`k', `k', 0)
+		matrix `propU'[1, 1] = 1
+		matrix `propU' = `T''*`propU'*`T'
+		local sigmabeta bscov(proportional `propU')
+	}
 	
 	// set up constraints on the BS variance of the interactions
 	// DF Note: Need to look at this again
-	if "`fixed'"=="" {
-		constraint 1 [chol11]_b[_cons] = `=`Chol'[1,1]'
-		constraint 2 [chol12]_b[_cons] = `=`Chol'[1,2]'
-		constraint 3 [chol22]_b[_cons] = `=`Chol'[1,3]'
+	else if "`structure'"!="user" & "`naive'"=="" {
+		local c = 0
+		forvalues i = 1 / `k1' {
+			forvalues j = 1 / `i' {
+				local ++c
+				
+				if "`structure'"=="unstructured" local el = `Chol'[1, `c']	// special case: see above
+				else local el = `Chol'[`i', `j']
+				
+				constraint free
+				constraint `r(free)' [chol`j'`i']_b[_cons] = `el'
+				local constr_list `constr_list' `r(free)'
+			}
+		}
+		
+		// if exhangeable, need to do a little more work
+		if "`structure'"=="exchangeable" {
+			tempname Chol_k
+			matrix define `Chol_k' = inv(`Chol') * J(`k1', 1, .5*(`tau'^2))
+			forvalues j = 1 / `k1' {
+				constraint free
+				constraint `r(free)' [chol`j'`k']_b[_cons] = `=`Chol_k'[`j', 1]'
+				local constr_list `constr_list' `r(free)'
+			}
+		}
+		
 		// constraint 4 y_Isubgroup_2=0
 		// constraint 5 y_Isubgroup_3=0
-		// constraint dir
-		local constr_opt constraints(1 2 3)
+		
+		if "`listconstraints'"!="" {
+		    nois disp as text _n "Constraints on elements of Cholesky factor for SigmaU:"
+			nois constraint dir `constr_list'
+		}
+		local constr_opt constraints(`constr_list')
 	}
+	else if "`structure'"=="user" & "`listconstraints'"!="" {
+		nois constraint dir `constraints'
+		local constr_opt constraints(`constraints')
+	}
+	if "`sigmabeta'"=="" local sigmabeta bscov(unstructured)	// this is the default for -mvmeta- , but make it explicit
 	
 	// fit model: make sure we are using "NEW" mvmeta
 	if "`showmodels'"!="" nois disp as text _n "Estimation of floating subgroup for reference category:"
-	`quietly' mvmeta_new y S, `eq' nocons commonparm print(bscov) `constr_opt' `fixed' `sigmabeta' `soptions'
+	`quietly' mvmeta_new y S, `eq' nocons commonparm `constr_opt' `sigmabeta' `soptions' `eformopt'
 	// Note: the coefficient of _cons refers to the reference subgroup
 	
 	// extract fitted BS variance and derive SigmaBeta
@@ -626,13 +676,17 @@ program define metafloat, eclass
 	matrix define `L'[2, 1] = I(`k1')
 	matrix define `SigmaU' = e(Sigma)
 	matrix define `SigmaBeta' = `L'*`SigmaU'*`L''
+
+	// define covariate data matrix Z (arranged such that the reference subgroup comes first)
+	tempname ones Z
+	matrix define `ones' = J(`k', 1, 1)			// column vector of ones, of length k
+	matrix define `Z' = J(`k', `k1', 0)
+	matrix define `Z'[2, 1] = I(`k1')	
 	
 	// compute implied means for beta
-	tempname ones ThetaHat BetaHat
-	matrix define `ones' = J(`k', 1, 1)			// column vector of ones, of length k
+	tempname ThetaHat BetaHat
 	matrix define `ThetaHat' = e(b)[1,1]
-	matrix define `BetaHat' = `ThetaHat'*`ones' + (0 \ `GammaHat')
-	// ^^ (0 \ `GammaHat') reflects the fact that the reference comes first
+	matrix define `BetaHat' = `ones'*`ThetaHat' + `Z'*`GammaHat'
 	
 	// IW June 2021: First derive `VarThetaHat' ignoring the uncertainty in the heterogeneity matrix
 	// because it's needed for deriving the gradient vector
@@ -642,17 +696,26 @@ program define metafloat, eclass
 	matrix define `VarThetaHat' = `VarThetaHat'[1,1]
 	matrix define `VarThetaHat' = invsym(`VarThetaHat')	
 
+	// Now define matrix A, the independent multiplier of GammaHat
+	tempname A
+	matrix define `A' = J(1, `k1', 0)
+	forvalues i = 1 / `t' {
+		matrix define `A' = `A' + `ones''*invsym(`W`i'' + `SigmaBeta')*`Z'
+	}
+	mat `A' = `Z' - `ones'*`VarThetaHat'*`A'
+
+	/*
 	tempname D GradSum Grad
 	matrix define `D' = J(`k', `k1', 0)
 	matrix define `D'[2, 1] = I(`k1')
 	matrix define `GradSum' = J(1, `k1', 0)
 	forvalues i = 1 / `t' {
-		matrix define `GradSum' = `GradSum' + `ones''*invsym(`W`i'' + `SigmaBeta')*`D'
+		matrix define `GradSum' = `GradSum' + `ones''*invsym(`W`i'' + `SigmaBeta')*`Z'
 	}
 	matrix define `Grad' = -`VarThetaHat'*`GradSum'
 	matrix rownames `Grad' = `: word 1 of `rownames_eb''
-	// matrix colnames `Grad' = `colnames_eb2'
 	matrix colnames `Grad' = `_Intnames'
+	*/
 	
 	// now correct VarThetaHat for uncertainty in the heterogeneity matrix, if requested
 	if `"`uncertainv'"'==`""' {
@@ -660,8 +723,9 @@ program define metafloat, eclass
 	}
 		
 	// correct variance for beta
-	tempname A VarBetaHat
-	matrix define `A' = `ones'*`Grad' + `D'
+	// tempname A VarBetaHat
+	// matrix define `A' = `ones'*`Grad' + `D'
+	tempname VarBetaHat
 	matrix define `VarBetaHat' = `VarThetaHat'*J(`k', `k', 1) + `A'*`VarGammaHat'*`A''
 	
 	// reverse transformation
@@ -671,14 +735,11 @@ program define metafloat, eclass
 	// ...also applies to SigmaBeta
 	matrix define `SigmaBeta' = `T''*`SigmaBeta'*`T'
 	matrix coleq `SigmaBeta' = ""
-	// matname `SigmaBeta' `bcolnames', explicit
 	matname `SigmaBeta' `_Inames', explicit
 	
 	// collect and display under "ereturn"
 	matrix define `BetaHat' = `BetaHat''
 	matrix coleq `BetaHat' = ""
-	// matname `BetaHat'    `bcolnames', columns(.) explicit
-	// matname `VarBetaHat' `bcolnames', explicit
 	matname `BetaHat'    `_Inames', columns(.) explicit
 	matname `VarBetaHat' `_Inames', explicit
 
@@ -687,45 +748,36 @@ program define metafloat, eclass
 	if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
 		
 		// store pooled estimates
-		tempfile pooled_main pooled_ints
+		tempfile pooled_ests
 		tempname BetaTable GammaTable
 		mat `GammaTable' = `GammaHat', vecdiag(`VarGammaHat')'
 		matrix rownames `GammaTable' = `sgvals2'
 		qui metani `GammaTable', variances nograph nooverall rownames rowtitle(Pooled estimates) ///
-			saving(`pooled_ints', stacklabel)
+			saving(`pooled_ests', stacklabel) prefix(_yInt)
 
 		mat `BetaTable' = `BetaHat'', vecdiag(`VarBetaHat')'
 		matrix rownames `BetaTable' = `sgvals'
 		qui metani `BetaTable', variances nograph nooverall rownames rowtitle(Pooled estimates) ///
-			saving(`pooled_main', stacklabel)
+			clearstack prefix(_y)
 
-		qui use `pooled_main', clear
-		foreach x of varlist _ES _seES _LCI _UCI _WT {
-			qui rename `x' _y`x'
-		}
-		qui merge 1:1 _LABELS using `pooled_ints'
-		list, nol
+		rename _y_LABELS _yInt_LABELS
+		tempvar sortorder
+		qui gen int `sortorder' = _n		// -merge- will sort the data on _yInt_LABELS, so need to re-sort afterwards
+		qui merge 1:1 _yInt_LABELS using `pooled_ests', assert(match master)
 		cap {
-			assert _merge==1 if _LABELS=="`ref'"
-			assert _merge==3 if _LABELS!="`ref'"
+			assert _merge==1 if _yInt_LABELS=="`ref'"
+			assert _merge==3 if _yInt_LABELS!="`ref'"
 		}
 		if _rc {
 			nois disp as err "Error in colnames [NEED TO IMPROVE THIS MESSAGE]"
 			exit _rc
 		}
-		drop _merge _EFFECT
-		foreach x of varlist _ES _seES _LCI _UCI _WT {
-			qui rename `x' _yInt`x'
-		}
-		
-		sort _USE _STUDY		// shouldn't need this!! check -metan- stacklabel option
-		// also at this point need to replace _STUDY with something else
-		// currently it contains values 1, 2, 3, ... by default
-		// need to replace with same values as in other `filename' datasets
-		// but how best to find out what those values are??
-		
-		qui replace _USE = 5 if inlist(_USE, 1, 2)
-		qui save `pooled_main', replace
+		drop _merge *_EFFECT _yInt_USE _yInt_STUDY
+		rename _y_STUDY _STUDY
+		rename _yInt_LABELS _LABELS		
+		qui replace _y_USE = 5 if inlist(_y_USE, 1, 2)
+		sort `sortorder'
+		qui save `pooled_ests', replace
 		
 		
 		// merge subgroup estimates and interaction estimates into a single dataset
@@ -734,53 +786,41 @@ program define metafloat, eclass
 		local vlist `"`r(varlist)'"'
 		
 		if `"`string'"'!=`""' local refr `r'
-		else local ref2 `ref'
+		else local refr `ref'
 		// ^^ REVISIT/SIMPLIFY
 		
-		local subgroup2 = substr(`"`subgroup'"', 1, 7)	// REVISIT
+		local subgroup7 = substr(`"`subgroup'"', 1, 7)	// REVISIT
 		foreach v of local vlist {
-			local newname = subinstr(`"`v'"', `"_cons"', `"_Int`subgroup2'_`refr'"', .)
+			local newname = subinstr(`"`v'"', `"_cons"', `"_Int`subgroup7'_`refr'"', .)
 			qui rename `v' `newname'
 		}
 		foreach x of local sgvals2`string' {		// <-- REVISIT/SIMPLIFY
-			local rsvlist `rsvlist' S_Int`subgroup2'_@_Int`subgroup2'_`x'
+			local rsvlist `rsvlist' S_Int`subgroup7'_@_Int`subgroup7'_`x'
 		}
-		
+		qui reshape long y_Int`subgroup7'_ `rsvlist', i(`study') j(`subgroup7')
 
-		desc, fullnames
-		/*qui*/ reshape long y_Int`subgroup2'_ `rsvlist', i(`study') j(`subgroup2')
-		
-		rename `subgroup2' `subgroup'		// REVISIT
+		if `"`subgroup7'"'!=`"`subgroup'"' {
+			qui rename `subgroup7' `subgroup'	// REVISIT
+		}
+		if `"`string'"'!=`""' {
+			rename `subgroup' `subgroup2'		// REVISIT
+			local subgroup `subgroup2'
+		}
 
-		desc `subgroup'
-		tab `subgroup', nol
-		
 		qui merge 1:1 `study' `subgroup' using `main_effects', assert(match) nogen
-
+		qui do `sglabfile'
+		label values `subgroup' `sglab'
+		
 		qui gen double S_Int`subgroup7'_ = .
 		order S_Int`subgroup7'_, after(y_Int`subgroup7'_)
-		foreach x of local sgvals {
-			if `x'==`ref' continue
-			/*
-			if `"`string'"'!=`""' {
-				qui replace S_Int`subgroup7'_ = S_Int`subgroup7'__Int`subgroup7'_`x' if `subgroup'==`"`x'"'
-			}
-			else {
-			*/
-				qui replace S_Int`subgroup7'_ = S_Int`subgroup7'__Int`subgroup7'_`x' if `subgroup'==`x'
-			// }
+		foreach x of local sgvals`string' {		// REVISIT
+			if `x'==`refr' continue
+			qui replace S_Int`subgroup7'_ = S_Int`subgroup7'__Int`subgroup7'_`x' if `subgroup'==`x'
 			drop S_Int`subgroup7'__Int`subgroup7'_`x'
 		}
-		/*
-		if `"`string'"'!=`""' {
-			qui replace y_Int`subgroup'_ = .  if `subgroup'==`"`ref'"'
-			qui replace S_Int`subgroup'_ = .  if `subgroup'==`"`ref'"'
-		}
-		else {
-		*/
-			qui replace y_Int`subgroup7'_ = .  if `subgroup'==`ref'
-			qui replace S_Int`subgroup7'_ = .  if `subgroup'==`ref'
-		// }
+		qui replace y_Int`subgroup7'_ = .  if `subgroup'==`refr'
+		qui replace S_Int`subgroup7'_ = .  if `subgroup'==`refr'
+
 		qui rename y_Int`subgroup7'_ _yInt_ES
 		qui replace _yInt_ES = . if S_Int`subgroup7'_ >= `augvariance'
 		qui gen double _yInt_seES = sqrt(S_Int`subgroup7'_) if S_Int`subgroup7'_ < `augvariance'
@@ -789,24 +829,29 @@ program define metafloat, eclass
 		// use -metan- to restructure the main effects
 		qui replace y = . if V >= `augvariance'
 		qui gen double stderr = sqrt(V) if V < `augvariance'
-		qui metan y stderr, nograph nohet nosubgroup nooverall keeporder clear ///
-			study(`subgroup') by(`study') rcols(_yInt_ES _yInt_seES)
-		qui drop _EFFECT
-		foreach x of varlist _ES _seES _LCI _UCI _WT {
-			qui rename `x' _y`x'
-		}
+		qui metan y stderr, nograph nohet nosubgroup nooverall keeporder ///
+			study(`subgroup') by(`study') rcols(_yInt_ES _yInt_seES) ///
+			clear prefix(_y)
+		qui drop *_EFFECT
+		qui rename _y_BY _BY
+		qui rename _y_STUDY _STUDY
+		qui rename _y_LABELS _LABELS
+		qui order _y_USE, before(_y_ES)
 
 		qui gen double _yInt_LCI = _yInt_ES - invnormal(.975)*_yInt_seES
 		qui gen double _yInt_UCI = _yInt_ES + invnormal(.975)*_yInt_seES
-		qui gen double _yInt_WT = 1/_yInt_seES^2 if _USE!=5
+		qui gen double _yInt_WT = 1/_yInt_seES^2 if _y_USE!=5
 		summ _yInt_WT, meanonly
 		qui replace _yInt_WT = 100*_yInt_WT / r(sum)
+		label variable _yInt_WT "% Weight"
+		format _yInt_WT %6.2f
 				
 		// append subgroup estimates
 		// ... and "correct" the contents of _STUDY (see above)
 		tempvar pooled obs
-		qui append using `pooled_main', gen(`pooled')
+		qui append using `pooled_ests', gen(`pooled')
 		qui gen int `obs' = _n
+		/*
 		forvalues i = 1 / `k' {
 			summ `obs' if _STUDY==`i' & `pooled', meanonly
 			local labi = _LABELS[`r(min)']
@@ -814,15 +859,21 @@ program define metafloat, eclass
 			local studyi = _STUDY[`r(min)']
 			qui replace _STUDY = `studyi' if `pooled' & _STUDY==`i'
 		}
+		*/
+		forvalues i = 1 / `k' {
+			local x : word `i' of `sgvals`string''
+			summ `obs' if _STUDY==`x' & !`pooled', meanonly
+			local labi = _LABELS[`r(min)']
+			qui replace _LABELS = `"`labi'"' if `pooled' & _STUDY==`i'	// REVISIT!!  may need to edit -metani-
+			qui replace _STUDY = `x' if `pooled' & _STUDY==`i'			// REVISIT!!  may need to edit -metani-
+		}
 		drop `pooled' `obs'
 		
-		qui rename _USE _y_USE
-		order _y_USE, before(_y_ES)
 		qui gen byte _yInt_USE = _y_USE
-		qui replace _yInt_USE = 9 if _LABELS=="`ref'"
+		qui replace _yInt_USE = 9 if _STUDY==`refr'
 		qui replace _yInt_USE = 2 if _yInt_USE==1 & missing(_yInt_seES)
 		order _yInt_USE, before(_yInt_ES)
-
+		
 		qui compress
 		
 		if `"`saving'"'!=`""' {
@@ -841,13 +892,20 @@ program define metafloat, eclass
 	ereturn matrix VarGammaHat = `VarGammaHat'
 	ereturn matrix ThetaHat    = `ThetaHat'
 	ereturn matrix VarThetaHat = `VarThetaHat'
-	ereturn matrix Grad        = `Grad'
+	// ereturn matrix Grad        = `Grad'
+	// ereturn matrix A = `A'
 	ereturn matrix SigmaGamma  = `SigmaGamma'
 	ereturn matrix SigmaBeta   = `SigmaBeta'
 	ereturn scalar n = `t'						// number of studies
 	ereturn scalar k = `k'						// number of subgroups
+	ereturn local bscov_Gamma `"`sigmagamma'"' 
+	ereturn local bscov_Beta `"`sigmabeta'"' 
 	
 	nois disp as text _n "Floating subgroups:"
 	ereturn display, `eformopt'
+
+	if `"`constr_list'"'!=`""' {
+	    constraint drop `constr_list'
+	}
 	
 end
