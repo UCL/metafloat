@@ -1,18 +1,39 @@
 *  v0.1 beta  David Fisher 10jan2021
 *  v0.2 beta  David Fisher 30mar2021
 *  v0.3 beta  David Fisher 21apr2021
-*! v0.4 beta  David Fisher 07may2021
+*  v0.4 beta  David Fisher 07may2021
+*  v0.5 beta  David Fisher 01jul2021
+*! v0.6 beta  David Fisher 12jul2021
 
+
+*** METAFLOAT ***
+* Routine for fitting the models described in Godolphin et al (2021)
+// by David Fisher, Peter Godolphin, Ian White
+// (MRC Clinical Trials Unit at UCL)
+
+* Release notes:
+// v0.5: following discusion between IW, PG, corrected code so that results remain invariant to change of reference
+//         under random-effects, with or without `nouncertainv'
+// v0.6: addition of `design' option; analogous to inconsistency parameters in NMA
+//       observations with extreme variances now set to be augmented
+
+* Syntax:
 // varlist (required) = effect size and std err
 // study, subgroup (required) = study & subgroup identifiers
+
 // default (no options) = unstructured random-effects
 // fixed = all fixed (common) effects
 // sigmagamma, sigmabeta = specify structures
-// trend = fit linear trend across subgroups, if applicable
+// trend = test for linear trend across subgroups (if applicable);
+//         note: presented subgroup estimates do *not* assume linear trend (i.e. trend is only *tested for*, not implemented)
+//         note: actual internal option name is `trend2'
+// trend(mat [, testonly]) = fit specific trend defined by matrix "mat"
+//         testonly = only *test* for this trend, do not present subgroup estimates assuming trend
+// noaugtrend = don't use variance augmentation for estimating trend
+// design = additional parameters in final model describing the available subgroups per trial (e.g. "single-subgroup" trials)
 
-
-// Note: under fixed-effects, all works fine
-//  but with unstructured random-effects, changing reference has an effect -- need to investigate
+// nouncertainv = -mvmeta- option; see mvmeta documentation
+// `options' = eform options, plus other options to pass to -mvmeta- e.g. tolerance()
 
 
 program define metafloat, eclass sortpreserve
@@ -20,24 +41,47 @@ program define metafloat, eclass sortpreserve
 	syntax varlist(numeric min=2 max=2) [if] [in], ///
 		STUDY(varname) SUBGROUP(varname) ///
 		[ FIXED RANDOMBeta EXCHangeable UNStructured SIGMAGamma(string) SIGMABeta(string) ///
-		 TREND2 TREND(string) AUGVARiance(real 1e5) SHOWmodels noUNCertainv * ]
+		 TREND2 TREND(string) AUGVARiance(real 1e5) noAUGTRend SHOWmodels noUNCertainv DESign * ]
 
 	marksample touse
 	
 	tokenize `varlist'
 	args y stderr
-
-	_get_eformopts, eformopts(`options')
-	local eformopt eform(`"`s(str)'"')
-
-	// check that varnames do not have prefix _I*
-	cap assert `"`=substr(`"`study'"', 1, 2)'"'!=`"_I"'
+	
+	cap assert `stderr' >= 0 if `touse'
 	if _rc {
-	    nois disp as err `"Cannot have {bf:study()} variable name beginning with {bf:_I}; please rename this variable"'
+		nois disp as err "Standard error cannot be negative"
+		exit 198
 	}
-	cap assert `"`=substr(`"`subgroup'"', 1, 2)'"'!=`"_I"'
-	if _rc {
-	    nois disp as err `"Cannot have {bf:subgroup()} variable name beginning with {bf:_I}; please rename this variable"'
+	
+	_get_eformopts, eformopts(`options') allowed(__all__) soptions
+	local eformopt eform(`"`s(str)'"')
+	local soptions `"`s(options)'"'
+
+	
+	** Check for potential conflicts in varnames:
+	// check that varnames do not have prefix _I*
+	foreach x in study subgroup {
+		cap assert `"`=substr(`"``x''"', 1, 2)'"'!=`"_I"'
+		if _rc {
+			nois disp as err `"Cannot have {bf:`x'()} variable name beginning with {bf:_I}; please rename this variable"'
+		}
+		if "`design'"!="" {
+			cap assert `"`=substr(`"``x''"', 1, 8)'"'!=`"_Design"'
+			if _rc {
+				nois disp as err `"Cannot have {bf:`x'()} variable name beginning with {bf:_Design}; please rename this variable"'
+			}
+		}
+	}
+	
+	// check that varnames are not called _fillin, _Trend, _One, _Zero
+	foreach v1 in study subgroup {
+		foreach v2 in fillin Trend One Zero {
+			cap assert `"``v1''"'!=`"_`v2'"'
+			if _rc {
+				nois disp as err `"Cannot have {bf:`v1'()} variable name equal to {bf:_`v2'}; please rename this variable"'
+			}
+		}
 	}
 	
 	// find number of subgroups
@@ -69,7 +113,8 @@ program define metafloat, eclass sortpreserve
 		}
 	}
 	
-	// preserve data, prior to editing
+	
+	** Preserve data, prior to editing
 	preserve
 
 	qui keep if `touse' & !missing(`study', `subgroup')
@@ -78,17 +123,57 @@ program define metafloat, eclass sortpreserve
 	tempvar V
 	qui gen double `V' = `stderr'^2				// Generate estimate of the variance (s-squared)
 	drop `stderr'
-
+	
 	// augment if missing subgroup data
 	qui fillin `study' `subgroup'
+	assert _fillin == missing(`y')
+	
+	// if any observed variances are larger than `augvariance'
+	//  (e.g. if estimated from very small sample)
+	// also set to _fillin
+	qui replace _fillin = 1 if `V' > `augvariance'
+
 	summ _fillin, meanonly
 	if r(sum) {
-		nois disp as text "The following subgroups are missing, and will be given augmented variances of " as res `augvariance' as text ":"
+		nois disp as text "The following subgroups are unobserved (or contain missing or extremely imprecise data)"
+		nois disp as text " and will be given augmented variances of " as res `augvariance' as text ":"
 		list `study' `subgroup' if _fillin
 	}
+	qui replace `V' = `augvariance' if _fillin
+	qui replace `y' = 0 if _fillin
+
+	// obtain "design", i.e. which subgroups are present
+	if "`design'"!="" {
+	    
+		// `subgroup' must either be numeric, or single-character string
+		cap confirm numeric variable `subgroup'
+		if _rc {
+		    tempvar lensub
+			gen `lensub' = length("`subgroup'")
+			summ `lensub', meanonly
+			if r(max) > 1 {
+			    nois disp as err "With option {bf:design}, variable {bf:subgroup()} must be either numeric, or use single string characters only"
+				exit 198
+			}
+		}
+		
+		qui gen _Design = ""
+		qui levelsof `study', local(slist)
+		foreach s of local slist {
+			cap confirm string variable `study'
+			if _rc {
+				qui levelsof `subgroup' if `study'==`s' & !_fillin
+				qui replace _Design = `"`r(levels)'"' if `study'==`s'			
+			}
+			else {
+				qui levelsof `subgroup' if `study'==`"`s'"' & !_fillin
+				qui replace _Design = `"`r(levels)'"' if `study'==`"`s'"'
+			}
+		}
+		local design_opt collapse((firstnm) _Design)
+		local showmodels showmodels
+	}
 	drop _fillin
-	qui replace `V' = `augvariance' if missing(`y')
-	qui replace `y' = 0   if missing(`y')
 	
 	// obtain subgroup names (for attaching to final matrices)
 	// NOTE: already ensured that no vars `y', `V', `study', `subgroup' have prefix _I*]
@@ -126,14 +211,14 @@ program define metafloat, eclass sortpreserve
 			local kr = `k' - `r'
 			local kr1 = `kr' + 1
 			matrix define `T' = J(1, `k', 0)
-			matrix `T'[1, `r'] = 1
+			matrix define `T'[1, `r'] = 1
 			if `r'==`k' {
-				matrix `T' = `T' \ ( I(`k1'), J(`k1', 1, 0))
+				matrix define `T' = `T' \ ( I(`k1'), J(`k1', 1, 0))
 			}
 			else {
 				tempname Id
 				matrix define `Id' = I(`k1')
-				matrix `T' = `T' \ ( `Id'[1..`k1', 1..`kr'], J(`k1', 1, 0), `Id'[1..`k1', `kr1'..`k1'] )
+				matrix define `T' = `T' \ ( `Id'[1..`k1', 1..`kr'], J(`k1', 1, 0), `Id'[1..`k1', `kr1'..`k1'] )
 			}
 		}
 	}
@@ -145,13 +230,21 @@ program define metafloat, eclass sortpreserve
 	foreach s of local slist {
 		local ++i
 		tempname W`i'
-		mkmat `V' if `study'==`s', matrix(`W`i'')
+		
+		cap confirm string variable `study'
+		if _rc {	
+			mkmat `V' if `study'==`s', matrix(`W`i'')
+		}
+		else {
+			mkmat `V' if `study'==`"`s'"', matrix(`W`i'')			
+		}
+		
 		cap assert rowsof(`W`i'')==`k'
 		if _rc {
 			nois disp as err `"Conformability error: study `s' has `=rowsof(`W`i'')' subgroups where it should have `k'"'
 			exit 503
 		}
-		matrix `W`i'' = diag(`T'*`W`i'')
+		matrix define `W`i'' = diag(`T'*`W`i'')
 	}
 	
 	
@@ -167,11 +260,16 @@ program define metafloat, eclass sortpreserve
 		}
 		else {
 			tempname d
-			forvalues i = 1 / `k1' {
-				matrix `d' = nullmat(`d') \ `i'	// linear trend
+			forvalues i = 1 / `k' {
+				matrix define `d' = nullmat(`d') \ `i'	// linear trend
 			}
-			// local trend2 commonparm /*noconstant*/
 			local testonly testonly
+			
+			// Convert `d' into a matrix of contrasts
+			// ... and apply transformation if reference is not first subgroup
+			tempname M
+			matrix define `M' = J(`k1', 1, -1), I(`k1')
+			matrix define `d' = `M' * `T' * `d'
 		}
 	}
 	else if "`trend'"!="" {
@@ -194,87 +292,120 @@ program define metafloat, eclass sortpreserve
 			tempname d
 			cap {
 				matrix define `d' = `anything'
-				assert rowsof(`d')==`k1'
+				assert rowsof(`d')==`k'
 				assert colsof(`d')==1
 			}
 			if _rc {
 				nois disp as err "matrix (`anything') not found, or has invalid dimensions"
-				nois disp as err "(should be a column vector of length equal to one fewer than the number of subgroups)"
+				nois disp as err "(should be a column vector of length equal to the number of subgroups)"
 				exit 198
-			}			
-			// local trend commonparm /*noconstant*/
-
+			}
+			
+			// Convert `d' into a matrix of contrasts
+			// ... and apply transformation if reference is not first subgroup
+			tempname M
+			matrix define `M' = J(`k1', 1, -1), I(`k1')
+			matrix define `d' = `M' * `T' * `d'
 		}
-		// matrix `d' = `T' * `d'		// NO!!  Revisit this.
 	}
-	/*
-	else {
-		local trend
-		local trend2
-	}
-	*/
 	
 	// generate contrasts (use prefix "_Int" = "interaction")
 	// Note: _y_cons is thereference subgroup (i.e NOT a contrast)
-	qui xi, prefix(_Int) : mvmeta_make regress `y' i.`subgroup' [iw=`V'^-1], mse1 by(`study') clear nodetails useconstant
+	qui xi, prefix(_Int) : mvmeta_make regress `y' i.`subgroup' [iw=`V'^-1], mse1 by(`study') `design_opt' clear nodetails useconstant
 	// N.B. regress ... [iw], mse1  is equivalent to using -vwls- 
 	//  but currently -mvmeta_make- and -vwls- don't like each other for some reason
-
+	
 	
 	** STEP 1: ESTIMATE INTERACTION (MEAN AND BS VARIANCE)
 	if "`showmodels'"=="" local quietly quietly
-	quietly mvmeta y S, vars(y_Int*) `fixed' `sigmagamma' /* `trend' `trend2' */
-	
-	/*
-	tempname integers
-	forvalues i = 1 / `k1' {
-		matrix `integers' = nullmat(`integers') \ `i'
-	}
-	matrix `VarGammaHat' = e(V)*`integers''*`integers'
-	matrix `GammaHat'    = e(b)*`integers'
-	*/
 
 	tempname VarGammaHat GammaHat SigmaGamma
 	if `"`trend'`trend2'"'!=`""' {
 		local eq
 		local i = 0
-		tokenize `e(yvars)'
+		local yvars : colnames e(b) 
+		
+		tokenize `yvars'
 		while `"`1'"'!=`""' {
 			local ++i
-			tempvar x`i'
-			qui gen `x`i'' = `d'[`i', 1]
-			local eq `eq' `1':`x`i'',
+			qui gen _Trend`i' = `d'[`i', 1]
+			local eq `eq' y`1':_Trend`i',
+			
+			if "`augtrend'"!="" {
+				tempvar y`1'
+				qui clonevar `y`1'' = y`1'
+			}
+			
 			macro shift
-		}	
-		`quietly' mvmeta y S, vars(y_Int*) `fixed' `sigmagamma' commonparm nocons eq(`eq')
-	
-		if `"`trend'"'!=`""' {
-			matrix `VarGammaHat' = e(V)*`d''*`d'
-			matrix `GammaHat'    = e(b)*`d'
-			matrix `SigmaGamma'  = e(Sigma)
 		}
-		else {		// if `trend2' , *test* for (linear) trend only;  now re-fit as standard model assuming no trend
-			quietly mvmeta y S, vars(y_Int*) `fixed' `sigmagamma'
-		}
-	
-		nois disp as text _n "Test for trend:"
-		// test _cons
-		test `x1'
-	}
-	else {
-		matrix `VarGammaHat' = e(V)[1..`k1', 1..`k1']
-		matrix `GammaHat'    = e(b)[1,       1..`k1']'		
-		matrix `SigmaGamma'  = e(Sigma)
 
-		nois disp as text _n "Test of interactions(s):"
-		testparm y*
+		// optional request to use "exact" data (no variance augmentation) for estimating trend
+		if "`augtrend'"!="" {
+			foreach v1 of local yvars {
+				foreach v2 of local yvars {
+					cap confirm variable S`v1'`v2'
+					if !_rc {
+						qui replace y`v1' = . if abs(S`v1'`v1') >= `augvariance'
+						qui replace y`v2' = . if abs(S`v2'`v2') >= `augvariance'
+
+						tempvar S`v1'`v2'
+						qui clonevar `S`v1'`v2'' = S`v1'`v2'
+						qui replace S`v1'`v2' = . if abs(S`v1'`v2') >= `augvariance'
+					}
+				}
+			}
+		}
+		
+		nois disp as text _n "Test for trend:"
+		`quietly' mvmeta y S, vars(y_Int*) `fixed' `sigmagamma' commonparm nocons eq(`eq') `soptions'
+		test _Trend1
+
+		if "`augtrend'"!="" {
+			foreach v1 of local yvars {
+				qui replace y`v1' = `y`v1''
+				drop `y`v1''
+				
+				foreach v2 of local yvars {
+					cap confirm variable S`v1'`v2'
+					if !_rc {
+						qui replace S`v1'`v2' = `S`v1'`v2''
+						drop `S`v1'`v2''
+					}
+				}
+			}
+		}		
+		
+		if `"`trend'"'!=`""' {
+			matrix define `VarGammaHat' = e(V)*`d''*`d'
+			matrix define `GammaHat'    = e(b)*`d'
+			matrix define `SigmaGamma'  = e(Sigma)
+		}
+		
+		// if `trend2' , *test* for (linear) trend only;  now re-fit as standard model assuming no trend
+		else {
+			`quietly' mvmeta y S, vars(y_Int*) `fixed' `sigmagamma' `soptions'
+			matrix define `VarGammaHat' = e(V)[1..`k1', 1..`k1']
+			matrix define `GammaHat'    = e(b)[1,       1..`k1']'
+			matrix define `SigmaGamma'  = e(Sigma)
+		}
+	}
+	
+	// default: test for individual contrasts
+	else {
+		nois disp as text _n "Test of interaction(s):"
+		`quietly' mvmeta y S, vars(y_Int*) `fixed' `sigmagamma' `soptions'
+		nois testparm y*
+
+		matrix define `VarGammaHat' = e(V)[1..`k1', 1..`k1']
+		matrix define `GammaHat'    = e(b)[1,       1..`k1']'		
+		matrix define `SigmaGamma'  = e(Sigma)
 	}
 	
 	// DF: revisit this bit; what to do if we *do* have `trend' ??
 	if `"`trend'"'==`""' {		
 		if `"`fixed'"'==`""' {
 			tempname Chol
-			matrix `Chol' = e(b)[1, `k'...]
+			matrix define `Chol' = e(b)[1, `k'...]
 		}
 	
 		local colnames_eV : colnames e(V)
@@ -296,19 +427,38 @@ program define metafloat, eclass sortpreserve
 	** STEP 2: ESTIMATE TREATMENT EFFECT IN REF GROUP (MEAN, BS VARIANCE AND BS CORRELATION WITH INTERACTIONS)
 	// subtract within-trial interactions from observed interaction data
 	// set up equations that make shifted interactions have mean zero
-	qui gen byte zero = 0
-	qui gen byte one  = 1
 	
+	qui gen byte _Zero = 0
+	qui gen byte _One  = 1
+
+	// DF July 2021: optionally adjust for "design"
+	if "`design'"!="" {
+	    tempvar obs
+		gen long `obs' = _n
+		local designvars
+		qui tab _Design, gen(_Design) sort
+		forvalues i = 2 / `r(r)' {
+		    summ `obs' if _Design`i'==1, meanonly
+			local destxt = _Design[`r(min)']
+			local destxt = subinstr(trim(`"`destxt'"'), " ", "_", .)
+			rename _Design`i' _Des_`destxt'
+			local designvars `designvars' _Des_`destxt'
+		}
+		drop _Design1
+	}		
+		
 	local eq
 	local i = 0
 	tokenize `e(yvars)'
 	while `"`1'"'!=`""' {
 	    local ++i
 		qui replace `1' = `1' - `GammaHat'[`i', 1]
-		local eq `eq' `1':zero,
+		local eq `eq' `1':_Zero `designvars',
+		// local eq `eq' `1':_Zero,
 		macro shift
 	}	
-	local eq eq(`eq' y_cons:one)
+	local eq eq(`eq' y_cons:_One `designvars')
+	// local eq eq(`eq' y_cons:_One `designvars')
 	
 	cap assert `i'==`k'-1
 	if _rc {
@@ -327,65 +477,66 @@ program define metafloat, eclass sortpreserve
 		// constraint dir
 		local constr_opt constraints(1 2 3)
 	}
-
+	
 	// fit model: make sure we are using "NEW" mvmeta
-	`quietly' mvmeta_new y S, `eq' nocons commonparm print(bscov) `constr_opt' `fixed' `sigmabeta'
+	if "`showmodels'"!="" nois disp as text _n "Estimation of floating subgroup for reference category:"
+	`quietly' mvmeta_new y S, `eq' nocons commonparm print(bscov) `constr_opt' `fixed' `sigmabeta' `soptions'
 	// Note: the coefficient of _cons refers to the reference subgroup
 	
 	// extract fitted BS variance and derive SigmaBeta
 	tempname L SigmaU SigmaBeta
 	matrix define `L' = J(`k', `k1', 0), J(`k', 1, 1)
-	matrix `L'[2, 1] = I(`k1')
+	matrix define `L'[2, 1] = I(`k1')
 	matrix define `SigmaU' = e(Sigma)
 	matrix define `SigmaBeta' = `L'*`SigmaU'*`L''
 	
 	// compute implied means for beta
-	tempname ones ThetaHat VarThetaHat BetaHat
+	tempname ones ThetaHat BetaHat
 	matrix define `ones' = J(`k', 1, 1)			// column vector of ones, of length k
-	matrix define `ThetaHat'    = e(b)[1,1]
-	// matrix define `VarThetaHat' = e(V)[1,1]
+	matrix define `ThetaHat' = e(b)[1,1]
 	matrix define `BetaHat' = `ThetaHat'*`ones' + (0 \ `GammaHat')
 	// ^^ (0 \ `GammaHat') reflects the fact that the reference comes first
 	
+	// IW June 2021: First derive `VarThetaHat' ignoring the uncertainty in the heterogeneity matrix
+	// because it's needed for deriving the gradient vector
+	tempname VarThetaHat
 	matrix define `VarThetaHat' = e(V)
+	matrix define `VarThetaHat' = invsym(`VarThetaHat')
+	matrix define `VarThetaHat' = `VarThetaHat'[1,1]
+	matrix define `VarThetaHat' = invsym(`VarThetaHat')	
 
-	// implement -nouncertainv- option
-	if `"`uncertainv'"'!=`""' {
-		matrix `VarThetaHat' = invsym(`VarThetaHat')
-		matrix `VarThetaHat' = `VarThetaHat'[1,1]
-		matrix `VarThetaHat' = invsym(`VarThetaHat')
-	}
-	else {
-		matrix `VarThetaHat' = `VarThetaHat'[1,1]
-	}
-	
-	// correct variance for beta
 	tempname D GradSum Grad
 	matrix define `D' = J(`k', `k1', 0)
-	matrix `D'[2, 1] = I(`k1')
+	matrix define `D'[2, 1] = I(`k1')
 	matrix define `GradSum' = J(1, `k1', 0)
 	forvalues i = 1 / `t' {
-		matrix `GradSum' = `GradSum' + `ones''*invsym(`W`i'' + `SigmaBeta')*`D'
+		matrix define `GradSum' = `GradSum' + `ones''*invsym(`W`i'' + `SigmaBeta')*`D'
 	}
 	matrix define `Grad' = -`VarThetaHat'*`GradSum'
 	matrix rownames `Grad' = `: word 1 of `rownames_eb''
 	matrix colnames `Grad' = `colnames_eb2'
 	
+	// now correct VarThetaHat for uncertainty in the heterogeneity matrix, if requested
+	if `"`uncertainv'"'==`""' {
+		matrix define `VarThetaHat' = e(V)[1,1]
+	}
+		
+	// correct variance for beta
 	tempname A VarBetaHat
 	matrix define `A' = `ones'*`Grad' + `D'
 	matrix define `VarBetaHat' = `VarThetaHat'*J(`k', `k', 1) + `A'*`VarGammaHat'*`A''
 	
 	// reverse transformation
-	matrix `BetaHat' = `T''*`BetaHat'
-	matrix `VarBetaHat' = `T''*`VarBetaHat'*`T'
+	matrix define `BetaHat'    = `T''*`BetaHat'
+	matrix define `VarBetaHat' = `T''*`VarBetaHat'*`T'
 
 	// ...also applies to SigmaBeta
-	matrix `SigmaBeta' = `T''*`SigmaBeta'*`T'
+	matrix define `SigmaBeta' = `T''*`SigmaBeta'*`T'
 	matrix coleq `SigmaBeta' = ""
 	matname `SigmaBeta' `colnames', explicit
 	
 	// collect and display under "ereturn"
-	matrix `BetaHat' = `BetaHat''
+	matrix define `BetaHat' = `BetaHat''
 	matrix coleq `BetaHat' = ""
 	matname `BetaHat'    `colnames', columns(.) explicit
 	matname `VarBetaHat' `colnames', explicit
