@@ -6,7 +6,7 @@
 *  v0.6 beta  David Fisher 12jul2021
 *  v0.7 beta  David Fisher 04aug2021
 *  v0.8 beta  David Fisher 20sep2021
-*! v0.8.2 beta  David Fisher 22oct2021
+*! v0.8.3 beta  David Fisher 05nov2021
 
 
 *** METAFLOAT ***
@@ -27,34 +27,43 @@
 //       moved sections into subroutines
 
 // TO DO:
-// are augmentations *always* necessary?  might there be scenarios in which they introduce inaccuracy??
 // sort into subroutines -- DONE
 // collapse() option to mvmeta_make -- DONE
-// strealine the "_Design" code a little more -- NEEDS MODIFICATION TO -metan-
+// strealine the "_Design" code a little more -- DONE BUT NEEDS UPDATE TO -metan-
 // debugging/test script
-
+// for the future: are augmentations *always* necessary?  might there be scenarios in which they introduce inaccuracy??
+// for the future: user-defined covariance structures (removed here to keep things simple)
 
 * Syntax:
 // varlist (required) = effect size and std err
 // study, subgroup (required) = study & subgroup identifiers
 
+* Heterogeneity covariance structures:
 // fixed = all fixed (common) effects
-// randombeta = common-effects on SigmaGamma; constant within and between-subgroup heterogeneity for SigmaBeta
-// exchangeable = exchangeable (single-parameter) structures for both SigmaGamma and SigmaBeta
 // default (no options) = unstructured random-effects for both SigmaGamma and SigmaBeta
-// naive = unstructured random-effects for both SigmaGamma and SigmaBeta, removing the constraint that they be related via the `M' matrix
-// sigmagamma, sigmabeta = manually specify structures
+// exchangeable = exchangeable structures for both SigmaGamma and SigmaBeta
+// randombeta = special-case of exchangeable with common-effects on SigmaGamma
+//   (implies constant within and between-subgroup heterogeneity for SigmaBeta)
+// wscorrzero = special-case of exchangeable with zero within-study covariances for SigmaBeta
 
+* Trend across subgroups:
+* [Note: if k > 2, *test* for trend is reported automatically, but is *not* imposed upon the estimates]
 // notrend = don't test for trend
-// trend = impose linear trend upon subgroup estimates
-// trend(mat) = fit specific trend defined by matrix "mat"
+// forcetrend = impose linear trend upon subgroup estimates
 
-//  [Note: if k > 2, *test* for trend is reported automatically, but is *not* imposed upon the estimates]
-
+* Other options:
+// augvariance = specify the augmentation variance for missing/imprecise observations
 // design = additional parameters in final model describing the available subgroups per trial (e.g. "single-subgroup" trials)
-
+// naive = unstructured random-effects for both SigmaGamma and SigmaBeta, removing the constraint that they be related via the `M' matrix
+// showmodels = all -mvmeta- models are displayed with -noisily- (by default some intermediate steps are done -quietly-)
+// listconstraints = list the constraints applied to the -mvmeta- model for estimating SigmaBeta, for debugging purposes
 // nouncertainv = -mvmeta- option; see mvmeta documentation
 // `options' = eform options, plus other options to pass to -mvmeta- e.g. tolerance()
+
+* Saved datasets:
+// saving() = save dataset of results, structured for use with -forestplot-  (i.e. matched subgroups and constrasts)
+// clear = leave dataset of results in memory, replacing original dataset
+// keepvars = carry forward variables from the original dataset into the saved dataset (includes "_Design" if specified)
 
 
 program define metafloat, eclass
@@ -79,10 +88,9 @@ program define metafloat, eclass
 	}
 
 	syntax varlist(numeric min=2 max=2) [if] [in], STUDY(varname) SUBGROUP(varname) ///
-		[ SHOWmodels DESign noTREND AUGVARiance(real 1e5) COLLapse(string) ///
-		CONSTRaints(numlist integer) LISTConstraints ///
-		noUNCertainv PRINT(string) ///		/* -mvmeta- options */
-		 SAVING(passthru) CLEAR * ]
+		[ SHOWmodels DESign AUGVARiance(real 1e5) FORCEtrend ///
+		  LISTConstraints noUNCertainv PRINT(string) ///		/* -mvmeta- options */
+		  SAVING(passthru) CLEAR KEEPVars(varlist) * ]
 		
 	_get_eformopts, eformopts(`options') allowed(__all__) soptions
 	local eformopt eform(`"`s(str)'"')
@@ -95,19 +103,18 @@ program define metafloat, eclass
 	//  so later on, we will need to truncate `subgroup' to 9 characters.
 	// Therefore, check here that this does not cause a conflict with other relevant varnames
 	local trunclen = 9
-	CheckConflict `varlist' `study' `subgroup', `design' trunclen(`trunclen')
-
-	marksample touse	
-	tokenize `varlist'
-	args y stderr
+	CheckConflict `varlist' `study' `subgroup' `keepvars', `design' trunclen(`trunclen')
 
 	
 	** Preserve data, prior to editing
 	preserve
-
+	marksample touse	
 	qui keep if `touse' & !missing(`study', `subgroup')
-	keep `y' `stderr' `study' `subgroup'
+	keep `varlist' `study' `subgroup' `keepvars'
 		
+	tokenize `varlist'
+	args y stderr
+
 	cap assert `stderr' >= 0
 	if _rc {
 		nois disp as err "Standard error cannot be negative"
@@ -123,6 +130,7 @@ program define metafloat, eclass
 		nois list `study' `subgroup' `y' `stderr' if `Ngroup' > 1
 		exit 198
 	}
+	drop `Ngroup'
 	
 	tempvar V
 	qui gen double `V' = `stderr'^2		// Generate estimate of the variance (s-squared)
@@ -154,19 +162,22 @@ program define metafloat, eclass
 	
 	// obtain "design", i.e. which subgroups are present
 	if "`design'"!="" {
-		local desvar __Design
+		local desvar _Design
 		qui gen `desvar' = ""
 		GetDesign `desvar', study(`study') subgroup(`subgroup')
-		local collapse `"`collapse' (firstnm) `desvar'"'
+		local collapse_opt `"collapse (firstnm) `desvar'"'
 		local showmodels showmodels
 	}
 	// drop _fillin
 
 	if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
 
-		// save subgroup value labels
-		tempfile sglabfile
-		cap confirm string variable `subgroup'		
+		* Save subgroup value labels
+		// Note: from Stata documentation:
+		// " -encode- looks at a string variable and makes an internal table of all the values it takes on...
+		// ... It then alphabetizes that list and assigns numeric codes "
+		// so ordering of -encode- ought to match with that of -levelsof-
+		cap confirm string variable `subgroup'
 		if !_rc {
 			tempvar subgroup2
 			tempname sglab
@@ -175,44 +186,46 @@ program define metafloat, eclass
 			qui rename `subgroup2' `subgroup'
 		}
 		else local sglab : value label `subgroup'
-		qui label save `sglab' using `sglabfile'
-
+		if `"`sglab'"'!=`""' {
+			tempfile sglabfile
+			qui label save `sglab' using `sglabfile'
+		}
 		local sgtrunc = substr(`"`subgroup'"', 1, `trunclen')
 		cap rename `subgroup' `sgtrunc'
-		
+
 		tempfile main_effects
 		qui save `main_effects'
 	}
 
 	sreturn clear	// in advance of running s-class subroutines TransMatrix and CovStruct
 	
-	// Generate transformation matrix based on choice of reference subgroup
+	// Generate transformation matrix `T' based on choice of reference subgroup (= identity matrix if ref = 1st subgroup)
 	// also define trend vector `d' if appropriate
 	tempname T d
 	TransMatrix `T' `d', subgroup(`subgroup') `soptions'
 	local sglist `"`s(sglist)'"'
 	local k `s(k)'
 	local ref `s(ref)'
-	local usertrend `s(usertrend)'
-	if `k' < 3 local trend notrend
+	if `k' < 3 {
+		local trend notrend
+		local forcetrend
+	}
 	
 	// Setup covariance structures
 	tempname sgmat propU
 	CovStruct `sgmat' `propU', k(`k') trans(`T') `s(options)'
-	local structure  `s(structure)'
-	local sigmagamma `s(sigmagamma)'	// user-defined only (structure = user)
-	local sigmabeta  `s(sigmabeta)'		// user-defined only (structure = user)
+	local structure  `s(structure)'		// must be one of: fixed, unstructured, exchangeable, randombeta, wscorrzero
+	local sigmagamma `s(sigmagamma)'
+	local sigmabeta  `s(sigmabeta)'
 	local naive      `s(naive)'			// "naive" = undocumented option; don't constrain SigmaBeta and SigmaGamma to be linked
 	local soptions `"`s(options)'"'
 	
-	if `"`usertrend'"'!=`""' {
-		cap assert `"`structure'"'==`"fixed"' | `"`s(default)'"'!=`""'		// either "fixed" specified, or no structure was specified
-		nois disp as err `"cannot specify {bf:`structure'} with {bf:trend`s(brackets)'}; random-effects structure is implied by use of trend"'
-		exit 184
-	}
-	if `"`constraints'"'!=`""' & `"`sigmabeta'"'!=`""' {
-		nois disp as err `"Option {bf:contraints()} is not valid with option {bf:sigmabeta()}"'
-		exit 198
+	if `"`forcetrend'"'!=`""' {
+		cap assert inlist(`"`structure'"', "fixed", "randombeta") | `"`s(default)'"'!=`""'		// either "fixed" or "randombeta" specified, or no structure was specified
+		if _rc {
+			nois disp as err `"cannot specify {bf:bscovariance(`structure')} with {bf:forcetrend}; random-effects structure is implied by use of trend"'
+			exit 184
+		}
 	}
 	
 	// Store Wi matrices, for later
@@ -241,7 +254,7 @@ program define metafloat, eclass
 	
 	
 	** Generate -mvmeta- dataset containing contrasts plus constant (reference subgroup)
-	if `"`collapse'"'!=`""' local collapse_opt `"collapse(`collapse')"'
+	// if `"`collapse'"'!=`""' local collapse_opt `"collapse(`collapse')"'
 	
 	// generate contrasts, using prefix _J
 	// Note: _y_cons is the reference subgroup (i.e NOT a contrast)
@@ -255,10 +268,17 @@ program define metafloat, eclass
 	// so in what follows, we will refer to `subgroup' truncated at 9 characters.
 	// (we have already determined that this does not cause a conflict with other relevant varnames)	
 
+	// Note: with non-integer-valued `subgroup', -xi- will code alphabetically, so `yvars' (see below) should be of the form:
+	// _J`subgroup'_1 ...  _J`subgroup'_`k'
+	// Because -levelsof- and -encode- also code alphabetically, we ought to be able to handle string-valued `subgroup' quite easily.
+	// [ Otherwise, -xi- will code "naturally"; that is_J`subgroup'_`x' where `x' is an actual value stored in `subgroup'. ]
+	
+	/*
 	if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
 		tempfile interactions
 		qui save `interactions'
-	}	
+	}
+	*/
 	
 	// form baseline expression
 	tokenize `yvars'
@@ -287,14 +307,10 @@ program define metafloat, eclass
 	if "`showmodels'"=="" local quietly quietly
 	if "`print'"=="" local print bscov
 
-	// if inlist("`structure'", "fixed", "randombeta") local sigmagamma fixed
-	// else if "`structure'"=="exchangeable" local sigmagamma bscov(exchangeable .5)
-	// else if `"`sigmagamma'"'==`""' local sigmagamma bscov(unstructured)
-
 	// fit as standard model (assuming no trend)
 	tempname VarGammaHat GammaHat SigmaGamma Chol
 	nois disp as text _n "Test of interaction(s):"
-	`quietly' mvmeta y S, vars(y_J*) print(`print') `sigmagamma' `soptions' `eformopt'
+	`quietly' mvmeta_new y S, vars(y_J*) print(`print') `sigmagamma' `soptions' `eformopt'
 	nois testparm y*
 	
 	local k1 = `k' - 1
@@ -303,18 +319,18 @@ program define metafloat, eclass
 	matrix define `SigmaGamma'  = e(Sigma)
 
 	// extract cholesky matrix of Sigma
-	if `"`sigmagamma'"'=="fixed" & `"`structure'"'!="fixed" {
-		matrix define `Chol' = J(`k1', `k1', 0)
-	}	
-	else if `"`structure'"'=="exchangeable" {		
+	if `"`structure'"'=="unstructured" {
+		// special case: if `unstructured', -mvmeta- outputs the elements of `Chol' as part of e(b)
+		// so don't bother packing them up into a matrix; we're only going to unpack them again later		
+		matrix define `Chol' = e(b)[1, `k'...]
+	}
+	else if inlist(`"`structure'"', "exchangeable", "wscorrzero") {
 		local tau = e(b)[1, `k']
 		cholesky2 `SigmaGamma' `Chol'
 		matrix define `Chol' = sign(`tau') * `Chol'
 	}
-	// special case: if `unstructured', -mvmeta- outputs the elements of `Chol' as part of e(b)
-	// so don't bother packing them up into a matrix; we're only going to unpack them again later
-	else if `"`structure'"'=="unstructured" {
-		matrix define `Chol' = e(b)[1, `k'...]
+	else if `"`structure'"'=="randombeta" {
+		matrix define `Chol' = J(`k1', `k1', 0)
 	}
 	
 	local rownames_eb : rownames e(b)
@@ -330,23 +346,23 @@ program define metafloat, eclass
 		tokenize `yvars'
 		while `"`2'"'!=`""' {	// this will ignore the final element, which is "_cons"
 			local ++i
-			qui gen _Trend`i' = `d'[`i', 1]
-			local eqlist `eqlist' y`1':_Trend`i',
+			qui gen _Trend_`i' = `d'[`i', 1]
+			local eqlist `eqlist' y`1':_Trend_`i',
 			macro shift
 		}
 		
 		local sgammatrend fixed
-		if `"`sigmagamma'"'!=`"fixed"' {
+		if !inlist(`"`structure'"', "fixed", "randombeta") {
 			tempname D
 			matrix define `D' = `d'*`d''
 			local sgammatrend bscov(proportional `D')
 		}
 
 		nois disp as text _n "Test for trend:"
-		`quietly' mvmeta y S, vars(y_J*) print(`print') `sgammatrend' commonparm nocons equations(`eqlist') `soptions' `eformopt'
-		test _Trend1
+		`quietly' mvmeta_new y S, vars(y_J*) print(`print') `sgammatrend' commonparm nocons equations(`eqlist') `soptions' `eformopt'
+		test _Trend_1
 		
-		if `"`usertrend'"'!=`""' {
+		if `"`forcetrend'"'!=`""' {
 			matrix define `VarGammaHat' = e(V)[1, 1]		// Gamma is a constant if `trend'
 			matrix define `GammaHat'    = e(b)[1, 1]
 			matrix define `SigmaGamma'  = e(Sigma)
@@ -354,10 +370,10 @@ program define metafloat, eclass
 			matrix define `VarGammaHat' = `VarGammaHat'*`d'*`d''
 			matrix define `GammaHat'    = `GammaHat'*`d''
 			
-			if "`sigmagamma'"=="fixed" {
+			if `"`structure'"'=="randombeta" {
 				matrix define `Chol' = J(`k1', `k1', 0)
 			}
-			else  {
+			else if `"`structure'"'!="fixed" {
 				local tau = e(b)[1, 2]
 				cholesky2 `SigmaGamma' `Chol'
 				matrix define `Chol' = sign(`tau') * `Chol'
@@ -399,28 +415,24 @@ program define metafloat, eclass
 		qui replace `1' = `1' - `GammaHat'[1, `i']
 		local eqlist `eqlist' `1':_Zero `designvars',
 		macro shift
-	}	
+	}
 	local eqlist equations(`eqlist' y_cons:_One `designvars')
-		
+	
 	// set up constraints on the BS variance of the interactions
 	// using the Cholesky matrix from STEP 1
-	if `"`structure'"'!="user" & `"`naive'"'==`""' {	
-		SetupConstraints `Chol', k(`k') structure(`structure')
+	if `"`structure'"'!="fixed" & `"`naive'"'==`""' {
+		SetupConstraints `Chol' `propU', k(`k') structure(`structure') `forcetrend'
 		local constr_list `s(constr_list)'
 		
-		if `"`listconstraints'"'!=`""' {
-		    nois disp as text _n "Constraints on elements of Cholesky factor for SigmaU:"
-			nois constraint dir `constr_list'
+		if `"`constr_list'"'!=`""' {
+			if `"`listconstraints'"'!=`""' {
+				nois disp as text _n "Constraints on elements of Cholesky factor for SigmaU:"
+				nois constraint dir `constr_list'
+			}
+			local constr_opt constraints(`constr_list')
 		}
-		local constr_opt constraints(`constr_list')
 	}
-	else if `"`structure'"'=="user" {
-		if `"`listconstraints'"'!=`""' {
-			nois constraint dir `constraints'
-		}
-		local constr_opt constraints(`constraints')
-	}
-	
+		
 	// fit model: make sure we are using "NEW" mvmeta
 	if "`showmodels'"!="" nois disp as text _n `"Estimation of floating subgroup for reference category`trendtext':"'
 	`quietly' mvmeta_new y S, print(`print') nocons commonparm `eqlist' `constr_opt' `sigmabeta' `soptions' `eformopt'
@@ -487,18 +499,41 @@ program define metafloat, eclass
 	
 	*** Construct saved dataset
 	if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
+
+		// reverse previous operation
+		local i = 0
+		tokenize `e(yvars)'
+		while `"`1'"'!=`""' {
+			local ++i
+			qui replace `1' = `1' + `GammaHat'[1, `i']
+			local eqlist `eqlist' `1':_Zero `designvars',
+			macro shift
+		}		
+
+		// generate matrices containing pooled estimates and variances
 		tempname BetaTable GammaTable
 		mat `GammaTable' = `GammaHat'', vecdiag(`VarGammaHat')'
-		local sgnoref : list sglist - ref		
-		matrix rownames `GammaTable' = `sgnoref'	
+		local sgnoref : list sglist - ref
+		matrix rownames `GammaTable' = `sgnoref'	// guaranteed to be numeric
+		matrix colnames `GammaTable' = y S
 	
 		mat `BetaTable' = `BetaHat'', vecdiag(`VarBetaHat')'
-		matrix rownames `BetaTable' = `sglist'
-
+		matrix rownames `BetaTable' = `sglist'		// guaranteed to be numeric
+		matrix colnames `BetaTable' = y S
+		
+		nois desc
+		keep `study' `subgroup' y_J* S_J*
+		
 		ProcessSavedData `GammaTable' `BetaTable', saving(`saving') ///
-			study(`study') subgroup(`sgtrunc') sglabfile(`sglabfile') ///
-			mainfile(`main_effects') intfile(`interactions') augvariance(`augvariance')
+			study(`study') subgroup(`sgtrunc') ///
+			mainfile(`main_effects') augvariance(`augvariance')
 
+		/*
+		ProcessSavedData `GammaTable' `BetaTable', saving(`saving') ///
+			study(`study') subgroup(`sgtrunc') sglabfile(`sglabfile' `sglab') ///
+			mainfile(`main_effects') intfile(`interactions') augvariance(`augvariance')
+		*/
+		
 		if `"`clear'"'!=`""' {
 			restore, not
 		}
@@ -534,7 +569,7 @@ end
 
 // Check that varnames do not conflict with each other
 program define CheckConflict
-	syntax varlist(numeric min=4 max=4), [ DESign TRUNCLEN(integer 9) ]
+	syntax varlist(numeric min=4), [ DESign TRUNCLEN(integer 9) ]
 	tokenize `varlist'
 	args y stderr study subgroup
 	
@@ -555,13 +590,16 @@ program define CheckConflict
 		}
 	}
 	
-	// check that varnames are not called y or V
-	foreach v1 in stderr study subgroup {
+	// check that varnames (including `keepvars') are not called y or V
+	foreach v1 of local varlist {
 		foreach v2 in y V {
 			cap assert `"``v1''"'!=`"`v2'"'
 			if _rc {
 				nois disp as err `"Variable name conflict"'
 				nois disp as err `"Variables {it:stderr}, {bf:study()} and {bf:subgroup()} must not be named {bf:`v2'}; please rename"'
+				if `"`5'"'!=`""' {	// `keepvars'
+					nois disp as err `"(this includes any variables in the {bf:keepvars()} option)"'
+				}
 				exit _rc
 			}
 		}
@@ -574,12 +612,15 @@ program define CheckConflict
 	}
 	
 	// check that varnames do not have prefix _I* or _J* (or _Design if applicable)
-	foreach x in y stderr study subgroup {
+	foreach x of local varlist {
 		foreach prefix in _I _J {
 			cap assert `"`=substr(`"``x''"', 1, 2)'"'!=`"`prefix'"'
 			if _rc {
 				nois disp as err `"Variable name conflict"'
 				nois disp as err `"Variables {it:y}, {it:stderr}, {bf:study()} and {bf:subgroup()} must not begin with {bf:`prefix'}; please rename"'
+				if `"`5'"'!=`""' {	// `keepvars'
+					nois disp as err `"(this includes any variables in the {bf:keepvars()} option)"'
+				}
 				exit _rc
 			}
 		}
@@ -588,18 +629,24 @@ program define CheckConflict
 			if _rc {
 				nois disp as err `"Variable name conflict"'
 				nois disp as err `"Variables {it:y}, {it:stderr}, {bf:study()} and {bf:subgroup()} must not begin with {bf:_Des}; please rename"'
+				if `"`5'"'!=`""' {	// `keepvars'
+					nois disp as err `"(this includes any variables in the {bf:keepvars()} option)"'
+				}
 				exit _rc
 			}
 		}
 	}
 
 	// check that varnames are not called _fillin, _Trend, _One, _Zero	
-	foreach v1 in y stderr study subgroup {
+	foreach v1 of local varlist {
 		foreach v2 in _fillin _Trend _One _Zero {
 			cap assert `"``v1''"'!=`"`v2'"'
 			if _rc {
 				nois disp as err `"Variable name conflict"'
 				nois disp as err `"Variables {it:y}, {it:stderr}, {bf:study()} and {bf:subgroup()} must not be named {bf:`v2'}; please rename"'
+				if `"`5'"'!=`""' {	// `keepvars'
+					nois disp as err `"(this includes any variables in the {bf:keepvars()} option)"'
+				}				
 				exit _rc
 			}
 		}
@@ -609,121 +656,58 @@ end
 
 // process covariance structures
 program define CovStruct, sclass
-	syntax anything, K(integer) TRANS(name) ///
-		[ FIXED RANDOMBeta EXCHangeable UNStructured SIGMAGamma(passthru) SIGMABeta(passthru) NAIVE * ]
-
+	syntax anything, K(integer) TRANS(name) [ BSCOVariance(string) NAIVE ///
+		FIXED UNStructured EXCHangeable RANDOMBeta WSCORRZero WSC0 * ]
+	
 	local soptions : copy local options
-	opts_exclusive `"`fixed' `randombeta' `exchangeable' `unstructured'"' `""' 184
-	local structure `fixed'`randombeta'`exchangeable'`unstructured'	
+	if `"`wsc0'"'!=`""' local wscorrzero wscorrzero
+	opts_exclusive `"`fixed' `unstructured' `exchangeable' `randombeta' `wscorrzero'"' `""' 184
+	local structure `fixed'`unstructured'`exchangeable'`randombeta'`wscorrzero'
 
-	// and parse pre-defined tempname matrices
+	if `"`structure'"'!=`""' {
+		if `"`bscovariance'"'!=`""' {
+			nois disp as err `"Cannot specify both {bf:`structure'} and {bf:bscovariance()}"'
+			exit 198
+		}
+	}
+	else {
+		local 0 `bscovariance'
+		syntax [ , FIXED UNStructured EXCHangeable RANDOMBeta WSCORRZero WSC0 ]
+		if `"`wsc0'"'!=`""' local wscorrzero wscorrzero
+		opts_exclusive `"`fixed' `unstructured' `exchangeable' `randombeta' `wscorrzero'"' `""' 184
+		local structure `fixed'`unstructured'`exchangeable'`randombeta'`wscorrzero'
+	}
+	
+	// parse pre-defined tempname matrices
 	tokenize `anything'
 	args sgmat propU
 	local T : copy local trans
 	
-	// user-defined covariance structures
-	if `"`sigmagamma'`sigmabeta'"'!=`""' {
-		if `"`structure'"'!=`""' {
-			nois disp as err `"Covariance structure {bf:`structure'} specified; options {bf:sigmagamma()} and {bf:sigmabeta()} are invalid"'
-			exit 198
-		}
-
-		// sigmagamma and/or sigmabeta are explicitly supplied
-		foreach x in sigmagamma sigmabeta {
-			if `"``x''"'!=`""' & `"``x''"'!="fixed" {
-				local 0 `", ``x''"'
-				syntax [, UNStructured PROPortional EXCHangeable EQuals CORRelation * ]
-				opts_exclusive `"`unstructured' `proportional' `exchangeable' `equals' `correlation'"' `""' 184
-				if `"`equals'"'!=`""' | `"`correlation'"'!=`""' {
-					nois disp as err `"Invalid option {bf:`x'(`equals'`correlation'} {it:matexp}{bf:)}"'
-					exit 198
-				}
-				if `"`unstructured'"'!=`""' & `"`options'"'!=`""' {
-					nois disp as err `"Invalid option {bf:`x'(`unstructured' `options')}"'
-					exit 198
-				}
-				local sp = cond("`x'"=="sigmagamma", "sg", "sb")
-				local `sp'struct `unstructured'`proportional'`exchangeable'
-				local `sp'opt `options'		// should be either a matrix or a number or nothing
-				local `x' `"bscov(``sp'struct' ``sp'opt')"'
-			}
-		}
-		
-		// define useful matrices:
-		// Linv = take user-specified SigmaBeta, and derive SigmaU (to bring user-specs in line with general options -- see matrix `L' in main routine)
-		// M = contrast matrix: derives gammas from betas
-		tempname Linv M
-		local k1 = `k' - 1
-		matrix define `Linv' = J(`k', `k1', 0), J(`k', 1, 1)
-		matrix define `Linv'[2, 1] = I(`k1')
-		matrix define `Linv' = inv(`Linv')
-		matrix define `M' = J(`k1', 1, -1), I(`k1')	
-		
-		// if sigmabeta is explicitly supplied but not sigmagamma, derive it (unless `naive')
-		local derivegamma = (`"`sigmabeta'"'!=`""' & `"`sigmabeta'"'!="fixed" & `"`sigmagamma'"'==`""' & `"`naive'"'==`""')
-		
-		if inlist(`"`sbstruct'"', "proportional", "exchangeable") {
-			if `"`sbstruct'"'=="proportional" {
-				cap {
-					confirm matrix `sbopt'
-					assert rowsof(`sbopt') = `k'
-					assert colsof(`sbopt') = `k'
-				}
-				if _rc {
-					nois disp as err `"{bf:sigmabeta()} option: `sbopt' is not `k'x`k'"'
-					exit 198
-				}
-				local A `sbopt'
-			}
-			else {				// exchangeable
-				tempname A
-				cap matrix define `A' = (1-`sbopt')*I(`k') + `sbopt'*J(`k', `k', 1)
-				if _rc {
-					nois disp as err `"{bf:sigmabeta()} option: syntax is {bf:exchangeable} {it:#}{bf:)} with -1<=#<=1"'
-					exit 198
-				}
-			}
-		
-			// derive SigmaGamma from SigmaBeta
-			if `derivegamma' {
-				matrix define `sgmat' = `M'*`A'*`M''
-				local sgopt `sgmat'
-			}
-			local sigmagamma `"bscov(`sgstruct' `sgopt')"'
-
-			// derive `propU' from SigmaBeta
-			matrix define `propU' = `Linv'*`A'*`Linv''
-			local sigmabeta  `"bscov(`sbstruct' `propU')"'
-		}
-		
-		local structure user
+	if `"`structure'"'=="fixed" {
+		local sigmagamma fixed
+		local sigmabeta fixed
 	}
-
-	// "built-in" structures
+	else if `"`structure'"'=="randombeta" {
+		local sigmagamma fixed
+		matrix define `propU' = J(`k', `k', 0)
+		matrix `propU'[`k', `k'] = 1
+		matrix `propU' = `T''*`propU'*`T'
+		local sigmabeta bscov(proportional `propU')
+	}		
 	else {
-		if `"`structure'"'=="fixed" {
-			local sigmagamma fixed
-			local sigmabeta fixed
-		}
-		else if `"`structure'"'=="randombeta" {
-			local sigmagamma fixed
-			tempname propU
-			matrix define `propU' = J(`k', `k', 0)
-			matrix `propU'[`k', `k'] = 1
-			matrix `propU' = `T''*`propU'*`T'
-			local sigmabeta bscov(proportional `propU')
-		}		
-		else {
-			local sigmagamma bscov(unstructured)
-			local sigmabeta bscov(unstructured)
+		local sigmagamma bscov(unstructured)
+		local sigmabeta bscov(unstructured)
 
-			if `"`structure'"'=="exchangeable" {
-				local sigmagamma bscov(exchangeable .5)
+		if inlist(`"`structure'"', "exchangeable", "wscorrzero") {
+			local sigmagamma bscov(exchangeable .5)
+			
+			if `"`structure'"'=="wscorrzero" {
+				local sigmabeta bscov(equals `propU')	// matrix yet to be defined -- depends on SigmaGamma
 			}
-			else if `"`structure'"'==`""' {
-				sreturn local default default
-				local structure unstructured
-			}
+		}
+		else if `"`structure'"'==`""' {
+			sreturn local default default
+			local structure unstructured
 		}
 	}
 
@@ -732,10 +716,10 @@ program define CovStruct, sclass
 		exit 198
 	}	
 	
-	sreturn local structure `structure'
+	sreturn local structure    `structure'
 	sreturn local sigmagamma `"`sigmagamma'"'
 	sreturn local sigmabeta  `"`sigmabeta'"'
-	sreturn local options `"`options'"'	
+	sreturn local options    `"`soptions'"'	
 
 end
 
@@ -782,7 +766,7 @@ end
 // ...and set up trend if appropriate
 program define TransMatrix, sclass
 
-	syntax namelist, subgroup(varname) [ TREND(string) TREND2 * ]
+	syntax namelist, subgroup(varname) [ noTRend * ]
 	tokenize `namelist'
 	args T d
 	
@@ -822,55 +806,24 @@ program define TransMatrix, sclass
 		local sglist `"`r(numlist)'"'
 		local ref : copy local r
 	}
-	// Note: `r' is the index; `ref' is the value (e.g. for labelling the matrix stripe elements)
 	
+	// Note:
+	// `sglist' is an **ordered** (according to -levelsof- ) list of subgroup identifiers
+	// `r' is the index w.r.t. `sglist'
+	// `ref' is the relevant element of `sglist' (e.g. for labelling the matrix stripe elements)
+	// (and, unless `string', `ref' will also be a numeric value, which may have a value label)
 	
-	*** TREND ***
-	if `k' < 3 {
-		nois disp `"{error}Cannot test for trend with fewer than 3 subgroups"'
-		local trend
-		local trend2
-	}
-	
-	tempname M
-	matrix define `M' = J(`k1', 1, -1), I(`k1')
-	if `"`trend'"'!=`""' {
-		if `"`trend2'"'!=`""' {
-			nois disp as err `"only one of {bf:trend} or {bf:trend()} is allowed"'
-			exit 184
-		}
-		cap {
-			matrix define `d' = `trend'
-			if colsof(`d')==`k' & rowsof(`d')==1 {
-				matrix define `d' = `d''
-			}
-			assert rowsof(`d')==`k'
-			assert colsof(`d')==1
-		}
-		if _rc {
-			nois disp as err `"matrix {bf:`trend'} not found, or has invalid dimensions"'
-			nois disp as err `"(should be a vector of length equal to the number of subgroups)"'
-			exit 198
-		}
-
-		// Convert `d' into a matrix of contrasts
-		// ... and apply transformation if reference is not first subgroup
-		matrix define `d' = `M' * `T' * `d'		
-		local brackets `"()"'
-	}
-	else {
+	* Setup test for trend
+	if `"`trend'"'==`""' {
 		forvalues i = 1 / `k' {
-			matrix define `d' = nullmat(`d') \ `i'	// linear trend
+			matrix define `d' = nullmat(`d') \ `i'	// linear trend (could in theory allow more general forms for `d')
 		}
 
 		// Convert `d' into a matrix of contrasts
 		// ... and apply transformation if reference is not first subgroup
+		tempname M
+		matrix define `M' = J(`k1', 1, -1), I(`k1')
 		matrix define `d' = `M' * `T' * `d'
-	}
-	
-	if `"`trend'`trend2'"'!=`""' {		
-		sreturn local brackets `brackets'
-		sreturn local usertrend usertrend
 	}
 	
 	sreturn local sglist `"`sglist'"'
@@ -883,6 +836,7 @@ end
 	
 program define cholesky2
 * produce an approximate cholesky decomposition, even if matrix is not positive definite
+* (Note: taken from -mvmeta- by Ian White)
 args M C
 cap matrix `C' = cholesky(`M')
 if _rc {
@@ -906,20 +860,26 @@ end
 
 program define SetupConstraints, sclass
 
-	syntax name(name=Chol), k(integer) structure(string) [usertrend]
-
+	syntax namelist(min=2 max=2), k(integer) structure(string) [forcetrend]
+	tokenize `namelist'
+	args Chol propU
+	
 	local k1 = `k' - 1
-	local c = 0
-	forvalues i = 1 / `k1' {
-		forvalues j = 1 / `i' {
-			local ++c
-			
-			if `"`structure'"'=="unstructured" local el = `Chol'[1, `c']	// special case: see above
-			else local el = `Chol'[`i', `j']
-			
-			constraint free
-			constraint `r(free)' [chol`j'`i']_b[_cons] = `el'
-			local constr_list `constr_list' `r(free)'
+	if `"`structure'"'!="wscorrzero" {
+		local c = 0
+		forvalues i = 1 / `k1' {
+			forvalues j = 1 / `i' {
+				local ++c
+				
+				if `"`structure'"'=="unstructured" & `"`forcetrend'"'==`""' {
+					local el = `Chol'[1, `c']	// special case: see above
+				}
+				else local el = `Chol'[`i', `j']
+				
+				constraint free
+				constraint `r(free)' [chol`j'`i']_b[_cons] = `el'
+				local constr_list `constr_list' `r(free)'
+			}
 		}
 	}
 	
@@ -936,12 +896,25 @@ program define SetupConstraints, sclass
 	}
 	
 	// similarly if trend
-	else if `"`usertrend'"'!=`""' {
+	else if `"`forcetrend'"'!=`""' {
 		forvalues j = 1 / `k1' {
 			constraint free
 			constraint `r(free)' [chol`j'`k']_b[_cons] = 0
 			local constr_list `constr_list' `r(free)'
 		}
+	}
+	
+	// finally, wscorrzero is a special case: SigmaBeta is completely defined by SigmaGamma
+	else if `"`structure'"'=="wscorrzero" {
+		local tau = `Chol'[1, 1]
+		
+		tempname LinvT		// = Linv * Linv^T
+		matrix define `LinvT' = I(`k') + J(`k', `k', 1)
+		matrix define `LinvT'[1, `k'] = J(`k1', 1, -1) 
+		matrix define `LinvT'[`k', 1] = J(1, `k1', -1) 
+		matrix define `LinvT'[`k', `k'] = 1
+
+		matrix define `propU' = ((`tau')^2)*`LinvT'
 	}
 	
 	// constraint 4 y_Isubgroup_2=0
@@ -965,34 +938,90 @@ program define ProcessSavedData
 	local sgnoref : rownames `GammaTable'
 	local sglist : rownames `BetaTable'
 	local ref : list sglist - sgnoref
+
+	if `"`sglabfile'"'!=`""' {
+		tokenize `sglabfile'
+		args sglabfile sglab
+		qui do `sglabfile'
+		local studylab_opt `"studylabel(`sglab')"'
+	}
+
+	// load interaction estimates, and merge in subgroup estimates to form a single dataset
+	qui use `intfile', clear
+	qui ds *_cons*						// y-vars and S-vars relating to the reference subgroup
+	local vlist `"`r(varlist)'"'
+
+	// prepare for reshape long
+	foreach x of local sglist {
+		if `x'==`ref' {
+			foreach v of local vlist {
+				local newname = subinstr(`"`v'"', `"_cons"', `"_J`subgroup'_`x'"', .)
+				qui rename `v' `newname'
+			}
+		}
+		local rsvlist `rsvlist' S_J`subgroup'_@_J`subgroup'_`x'
+	}
+	qui reshape long y_J`subgroup'_ `rsvlist', i(`study') j(`subgroup')
+
+	local Xij : char _dta[ReS_Xij]
+	local Xij = subinstr(`"`Xij'"', `"@"', `""', .)
+	qui ds `study' `subgroup' `Xij' _pp*, not
+	local lcolvars `"`r(varlist)'"'
+	
+	qui merge 1:1 `study' `subgroup' using `mainfile', assert(match) nogen
+	
+	// add in pooled estimates
+	svmat `BetaTable'
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
 	
 	// store pooled estimates:
 	tempfile pooled_ests
-	qui metani `GammaTable', variances nograph nooverall rownames rowtitle(Pooled estimates) ///
+	qui metani_new `GammaTable', variances nograph nooverall rownames `studylab_opt' studytitle(Pooled estimates) ///
 		saving(`pooled_ests', stacklabel) prefix(_yInt)
 
-	qui metani `BetaTable', variances nograph nooverall rownames rowtitle(Pooled estimates) ///
+	qui metani_new `BetaTable', variances nograph nooverall rownames `studylab_opt' studytitle(Pooled estimates) ///
 		clearstack prefix(_y)
 
-	rename _y_LABELS _yInt_LABELS
+	rename _y_STUDY _yInt_STUDY
 	
 	tempvar sortorder
 	qui gen int `sortorder' = _n		// -merge- will sort the data on _yInt_LABELS, so need to re-sort afterwards
-	qui merge 1:1 _yInt_LABELS using `pooled_ests', assert(match master)
+	qui merge 1:1 _yInt_STUDY using `pooled_ests', assert(match master)
 	cap {
-		assert _merge==1 if _yInt_LABELS=="`ref'"
-		assert _merge==3 if _yInt_LABELS!="`ref'"
+		assert _merge==1 if _yInt_STUDY==`ref'
+		assert _merge==3 if _yInt_STUDY!=`ref'
 	}
 	if _rc {
 		nois disp as err "Error when merging interaction data with main-effect data"
 		exit _rc
 	}
 
-	drop _merge *_EFFECT _yInt_USE _yInt_STUDY
-	rename _y_STUDY _STUDY
-	rename _yInt_LABELS _LABELS
+	drop _merge *_EFFECT _yInt_USE _yInt_LABELS
+	rename _y_LABELS _LABELS
+	rename _yInt_STUDY _STUDY
 	qui replace _y_USE = 5 if inlist(_y_USE, 1, 2)
-	sort `sortorder'
+	sort `sortorder'	
 	qui save `pooled_ests', replace
 
 	// merge subgroup estimates and interaction estimates into a single dataset
@@ -1001,11 +1030,13 @@ program define ProcessSavedData
 	local vlist `"`r(varlist)'"'
 
 	// prepare for reshape long
-	foreach v of local vlist {
-		local newname = subinstr(`"`v'"', `"_cons"', `"_J`subgroup'_`ref'"', .)
-		qui rename `v' `newname'
-	}
 	foreach x of local sglist {
+		if `x'==`ref' {
+			foreach v of local vlist {
+				local newname = subinstr(`"`v'"', `"_cons"', `"_J`subgroup'_`x'"', .)
+				qui rename `v' `newname'
+			}
+		}
 		local rsvlist `rsvlist' S_J`subgroup'_@_J`subgroup'_`x'
 	}
 	qui reshape long y_J`subgroup'_ `rsvlist', i(`study') j(`subgroup')
@@ -1033,11 +1064,14 @@ program define ProcessSavedData
 	qui replace _yInt_ES = . if S_J`subgroup'_ >= `augvariance'
 	qui gen double _yInt_seES = sqrt(S_J`subgroup'_) if S_J`subgroup'_ < `augvariance'
 	drop S_J`subgroup'_
+
+	nois list
+	nois list, nol
 	
 	// use -metan- to restructure the main effects
 	qui replace y = . if V >= `augvariance'
 	qui gen double stderr = sqrt(V) if V < `augvariance'
-	qui metan y stderr, nograph nohet nosubgroup nooverall keeporder ///
+	qui metan_new y stderr, nograph nohet nosubgroup nooverall keeporder ///
 		study(`subgroup') by(`study') rcols(`lcolvars' _yInt_ES _yInt_seES) ///
 		clear prefix(_y)
 	qui drop *_EFFECT
@@ -1054,21 +1088,8 @@ program define ProcessSavedData
 	label variable _yInt_WT "% Weight"
 	format _yInt_WT %6.2f
 			
-	// append subgroup estimates
-	// ... and "correct" the contents of _STUDY (see above)
-	tempvar pooled obs
-	qui append using `pooled_ests', gen(`pooled')
-	qui gen int `obs' = _n
-	local i = 0
-	foreach x of local sglist {
-		local ++i
-		summ `obs' if _STUDY==`x' & !`pooled', meanonly
-		local labi = _LABELS[`r(min)']
-		qui replace _LABELS = `"`labi'"' if `pooled' & _STUDY==`i'
-		qui replace _STUDY = `x' if `pooled' & _STUDY==`i'
-	}
-	drop `pooled' `obs'
-	
+	// finally, append subgroup estimates
+	qui append using `pooled_ests'
 	qui gen byte _yInt_USE = _y_USE
 	qui replace _yInt_USE = 9 if _STUDY==`ref'
 	qui replace _yInt_USE = 2 if _yInt_USE==1 & missing(_yInt_seES)
