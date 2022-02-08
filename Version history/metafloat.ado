@@ -7,7 +7,8 @@
 *  v0.7 beta  David Fisher 04aug2021
 *  v0.8 beta  David Fisher 20sep2021
 *  v0.9 beta  David Fisher 14dec2021
-*! v0.10 beta  David Fisher 11jan2022
+*  v0.10 beta  David Fisher 11jan2022
+*! v0.11 beta  David Fisher 03feb2022
 
 
 *** METAFLOAT ***
@@ -29,6 +30,8 @@
 // v0.10: changes to matrix setup to aid correspondence with -ipdfloat-
 //       specifically: study-level variance matrices are derived from mvmeta_make rather than "manually" from the raw data
 //       but since the parameterisation used by mvmeta_make is different, these matrices then need to be used in a slightly different way
+// v0.11: improvements to handling of `subgroup' as numeric/string
+//       fixed bug with saving/clear, where lack of data meant "interaction" dataset did not contain one or more studies in "main" dataset
 
 // TO DO:
 // debugging/test script
@@ -166,63 +169,18 @@ program define metafloat, eclass
 	qui replace V = `augvariance' if _fillin
 	qui replace b = 0 if _fillin
 	
-	// obtain "design", i.e. which subgroups are present
-	if "`design'"!="" {
-		local desvar _Design
-		qui gen `desvar' = ""
-		GetDesign `desvar', study(`study') subgroup(`subgroup')
-		local showmodels showmodels
-	}
-	if trim(`"`desvar'`keepvars'"')!=`""' {
-		local collapse_opt `"collapse((firstnm) `desvar' `keepvars')"'
-	}
-
-	if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
-
-		* Save subgroup value labels
-		// Note: from Stata documentation:
-		// " -encode- looks at a string variable and makes an internal table of all the values it takes on...
-		// ... It then alphabetizes that list and assigns numeric codes "
-		// so ordering of -encode- ought to match with that of -levelsof-
-		cap confirm string variable `subgroup'
-		if !_rc {
-			tempvar subgroup2
-			tempname sglab
-			qui encode `subgroup', gen(`subgroup2') label(`sglab')
-			qui drop `subgroup'
-			qui rename `subgroup2' `subgroup'
-		}
-		else local sglab : value label `subgroup'
-
-		// later, we will need to merge on `subgroup'
-		// but it appears -merge- cannot keep its value label
-		// therefore, attach it to y instead, and retrieve it later
-		if `"`sglab'"'!=`""' {
-			label values b
-			label values b `sglab'
-		}
-
-		local trunclen = 9
-		local sgtrunc = substr(`"`subgroup'"', 1, `trunclen')
-		if `"`sgtrunc'"'!=`"`subgroup'"' {
-			qui rename `subgroup' `sgtrunc'
-			local subgroup `sgtrunc'
-		}
-		
-		tempfile main_effects
-		qui save `main_effects'
-	}
-
 	sreturn clear	// in advance of running s-class subroutines TransMatrix and CovStruct
 	
-
 	// Generate transformation matrix `T' based on choice of reference subgroup (= identity matrix if ref = 1st subgroup)
-	// also define trend vector `d' if appropriate
-	tempname T d
-	TransMatrix `T' `d', subgroup(`subgroup') `soptions'
-	local sglist `"`s(sglist)'"'
+	// - convert strings and non-integer subgroups to integers (saving original contents in value labels if appropriate)
+	// - obtain "design", i.e. which subgroups are present
+	// - also define trend vector `d' if appropriate
+	tempvar newsubgp desvar
+	tempname T d sglab
+	GetRef `study' `subgroup', newvars(`newsubgp' `desvar') sglab(`sglab') matrices(`T' `d') `design' `soptions'
 	local k `s(k)'
 	local ref `s(ref)'
+	local sglab `s(sglab)'
 	if `k' < 3 {
 		local trend notrend
 		local forcetrend
@@ -244,9 +202,30 @@ program define metafloat, eclass
 			exit 184
 		}
 	}
-	
-	
 		
+	// If saving/clear, then later we will need to merge on `subgroup'
+	// but it appears -merge- cannot keep its value label
+	// therefore, attach it to y instead, and retrieve it later
+	if `"`sglab'"'!=`""' {
+		label values b
+		label values b `sglab'
+	}
+	
+	// also save `study' variable label
+	local studylab : variable label `study'
+
+	if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
+		
+		// it is possible that, due to insufficient data, one or more studies may not be present after mvmeta_make
+		// therefore we will need to be careful when merging (see -SavingClear- )
+		// in particular, generate `sortorder' to guarantee the original order can always be recovered
+		tempvar sortorder
+		gen int `sortorder' = _n
+		
+		tempfile main_effects
+		qui save `main_effects'
+	}	
+	
 	// Generate contrasts, using prefix _J
 	// Note: y_cons is the reference subgroup (i.e NOT a contrast)
 	qui xi, noomit prefix(_J) i.`subgroup'
@@ -280,29 +259,6 @@ program define metafloat, eclass
 		}
 	}
 	
-	// Extract abbreviated version of `subgroup' used in xi-derived variable names
-	// and check that it can be successfully unabbreviated
-	gettoken sgabbrev : usevars
-	local sgabbrev = reverse(substr(`"`sgabbrev'"', 3, .))	// remove prefix "_J", and reverse...
-	gettoken number rest : sgabbrev, parse("_")				// ...so that we can remove the final "_#" stub
-	confirm number `number'
-	gettoken us rest : rest, parse("_")
-	assert `"`us'"'==`"_"'
-	local sgabbrev = reverse(`"`rest'"')
-	cap {
-		unab sgunab : `sgabbrev', max(1)
-		assert `"`sgunab'"'==`"`subgroup'"'
-	}
-	if _rc {
-		nois disp as err `"Variable name conflict"'
-		nois disp as err `"variable name {bf:`subgroup'} in required option {bf:subgroup()} is not sufficiently different"'
-		nois disp as err `"from another variable name supplied to this command; please check"'
-		if `"`keepvars'"'!=`""' {
-			nois disp as err `"(this includes any variables in the {bf:keepvars()} option)"'
-		}
-		exit _rc
-	}
-	
 	local matexist : all matrices "S*"
 	if `"`matexist'"'!=`""' {
 		nois disp `"{error}Note: the following matrices in memory will be cleared as a result of running this command:"'
@@ -312,7 +268,7 @@ program define metafloat, eclass
 			
 
 	** Generate -mvmeta- dataset containing contrasts plus constant (reference subgroup)	
-	qui mvmeta_make regress b `usevars' [iw=V^-1], mse1 by(`study') keepmat `collapse_opt' clear nodetails useconstant
+	qui mvmeta_make regress b `usevars' [iw=V^-1], mse1 by(`study') keepmat clear nodetails useconstant
 	cap confirm numeric variable `Jyvars' y_cons
 	if _rc {
 		nois disp as err "Error: inconsistency in matrix stripe elements"
@@ -327,6 +283,7 @@ program define metafloat, eclass
 
 
 	** STEP 1: ESTIMATE INTERACTION (MEAN AND BS VARIANCE)
+	if "`design'"!="" local showmodels showmodels
 	if "`showmodels'"=="" local quietly quietly
 	if "`print'"=="" local print bscov
 
@@ -365,7 +322,7 @@ program define metafloat, eclass
 	}
 	
 	local rownames_eb : rownames e(b)
-	matrix rownames `GammaHat' = `: word 1 of `rownames_eb''	// REVISIT
+	matrix rownames `GammaHat' = `: word 1 of `rownames_eb''	
 	matrix coleq `GammaHat' = :
 	matrix coleq `VarGammaHat' = :
 	matrix roweq `VarGammaHat' = :
@@ -467,7 +424,7 @@ program define metafloat, eclass
 		}
 	}
 	
-	// fit model: make sure we are using "NEW" mvmeta
+	// fit model: make sure we are using -mvmeta- version 3.5.1 # Ian White # 21dec2021 (or later)
 	if "`showmodels'"!="" nois disp as text _n `"Estimation of floating subgroup for reference category`trendtext':"'
 	`quietly' mvmeta y S, print(`print') nocons commonparm `eqlist' `constr_opt' `sigmabeta' `soptions' `eformopt'
 	// Note: the coefficient of _cons refers to the reference subgroup
@@ -559,17 +516,10 @@ program define metafloat, eclass
 		// generate matrices containing pooled estimates and variances
 		tempname BetaTable GammaTable
 		matrix define `GammaTable' = `GammaHat'', vecdiag(`VarGammaHat')'
-		local sgnoref : list sglist - ref
-		matrix rownames `GammaTable' = `sgnoref'	// guaranteed to be numeric
-		matrix colnames `GammaTable' = _yInt _yInt_S
-	
 		matrix define `BetaTable' = `BetaHat'', vecdiag(`VarBetaHat')'
-		matrix rownames `BetaTable' = `sglist'		// guaranteed to be numeric
-		matrix colnames `BetaTable' = _y _y_S
 		
-		ProcessSavedData `GammaTable' `BetaTable', saving(`saving') ///
-			study(`study') subgroup(`sgabbrev') ///
-			mainfile(`main_effects') augvariance(`augvariance')
+		SavingClear `GammaTable' `BetaTable', study(`study') mainfile(`main_effects') sortorder(`sortorder') ///
+			saving(`saving') augvariance(`augvariance')
 	
 		if `"`clear'"'!=`""' {
 			restore, not
@@ -684,59 +634,91 @@ program define CovStruct, sclass
 end
 
 
+// Generate transformation matrix `T' based on choice of reference subgroup (= identity matrix if ref = 1st subgroup)
+// - convert strings and non-integer subgroups to integers (saving original contents in value labels if appropriate)
+// - obtain "design", i.e. which subgroups are present
+// - also define trend vector `d' if appropriate
+program define GetRef, sclass
 
-program define GetDesign
-	syntax varname(string), study(varname) subgroup(varname)
+	syntax varlist(min=2 max=2), newvars(namelist min=2 max=2) sglab(name) matrices(namelist min=2 max=2) [ DESign noTRend * ]
+	tokenize `varlist'
+	args study subgroup
 
-	cap confirm variable _fillin
-	if _rc {
-		nois disp as err "variable {bf:_fillin} not found"
-		exit _rc
+	tokenize `newvars'
+	args subgroup2 desvar
+
+	* If `subgroup' is string (or contains non-integer values), convert to numeric so that later code runs smoothly
+	cap confirm numeric variable `subgroup'
+	if !_rc {
+		local ok = 1
+		qui levelsof `subgroup', local(sglist)
+		foreach val of local sglist {
+			cap assert `val' == int(`val')
+			if _rc local ok = 0
+		}
+		if !`ok' {	// non-integer values found
+			tempvar subgroup2
+			tempname sglab
+			egen `subgroup2' = group(`subgroup'), label(`sglab')
+			local sgomit : char `subgroup'[omit]
+			if `"`sgomit'"'!=`""' {
+				confirm number `sgomit'
+				summ `subgroup2' if float(`subgroup')==float(`sgomit'), meanonly
+				char `subgroup2'[omit] `r(min)'
+			}
+			qui drop `subgroup'
+			qui rename `subgroup2' `subgroup'
+			qui levelsof `subgroup', local(sglist)
+		}
+		else local sglab : value label `subgroup'
 	}
-	qui levelsof `study', local(slist)
+	else {	// string format found
+		tempvar subgroup2
+		tempname sglab
+		qui encode `subgroup', gen(`subgroup2') label(`sglab')
+		local sgomit : char `subgroup'[omit]
+		if `"`sgomit'"'!=`""' {
+			summ `subgroup2' if `subgroup'==`"`sgomit'"', meanonly
+			char `subgroup2'[omit] `r(min)'
+		}
+		qui drop `subgroup'
+		qui rename `subgroup2' `subgroup'
+		qui levelsof `subgroup', local(sglist)
+	}
 	
-	// `subgroup' must either be numeric, or single-character string
-	cap confirm string variable `subgroup'
-	if !_rc local string string
-
-	if `"`string'"'!=`""' {
-		tempvar lensub
-		gen `lensub' = length(`subgroup')
-		summ `lensub', meanonly
-		if r(max) > 1 {
-			nois disp as err "With option {bf:design}, variable {bf:subgroup()} must be either numeric, or use single string characters only"
-			exit 198
+	* Sort out "design"
+	if `"`design'"'!=`""' {
+		cap confirm variable _fillin
+		if _rc {
+			nois disp as err "variable {bf:_fillin} not found"
+			exit _rc
+		}
+		local desvar _Design
+		qui gen `desvar' = ""
+		
+		cap confirm numeric variable `study'
+		local string = _rc
+		qui levelsof `study', local(stlist)
+		foreach s of local stlist {
+			if `string' {
+				qui levelsof `subgroup' if `study'==`"`s'"' & !_fillin, clean
+				qui replace `varlist' = `"`r(levels)'"' if `study'==`"`s'"'
+			}
+			else {
+				qui levelsof `subgroup' if `study'==`s' & !_fillin
+				qui replace `varlist' = `"`r(levels)'"' if `study'==`s'			
+			}
 		}
 	}
 	
-	foreach s of local slist {
-		if `"`string'"'!=`""' {
-			qui levelsof `subgroup' if `study'==`"`s'"' & !_fillin, clean
-			qui replace `varlist' = `"`r(levels)'"' if `study'==`"`s'"'
-		}
-		else {
-			qui levelsof `subgroup' if `study'==`s' & !_fillin
-			qui replace `varlist' = `"`r(levels)'"' if `study'==`s'			
-		}
-	}
-end
-	
-	
-// Generate transformation matrix based on choice of reference subgroup
-// ...and set up trend if appropriate
-program define TransMatrix, sclass
-
-	syntax namelist, subgroup(varname) [ noTRend * ]
-	tokenize `namelist'
-	args T d
-	
+	* Sort out reference values and generate transformation matrix
 	qui tab `subgroup'
 	local k = r(r)
 	local k1 = `k' - 1
-	cap confirm string variable `subgroup'
-	if !_rc local string string
-	qui levelsof `subgroup', local(sglist)
 
+	tokenize `matrices'
+	args T d	
+	
 	if `"`: char `subgroup'[omit]'"'==`""' {
 		local r = 1
 		gettoken ref sgnoref : sglist
@@ -766,17 +748,12 @@ program define TransMatrix, sclass
 			}
 		}
 	}
-	if `"`string'"'!=`""' {
-		qui numlist "1(1)`k'"
-		local sglist `"`r(numlist)'"'
-		local ref : copy local r
-	}
 	
 	// Note:
 	// `sglist' is an **ordered** (according to -levelsof- ) list of subgroup identifiers
 	// `r' is the index w.r.t. `sglist'
 	// `ref' is the relevant element of `sglist' (e.g. for labelling the matrix stripe elements)
-	// (and, unless `string', `ref' will also be a numeric value, which may have a value label)
+	// (and `ref' will also be a numeric value, which may have a value label, especially if `subgroup' was originally string)
 	
 	* Setup test for trend
 	if `"`trend'"'==`""' {
@@ -791,9 +768,9 @@ program define TransMatrix, sclass
 		matrix define `d' = `M' * `T' * `d'
 	}
 	
-	sreturn local sglist `"`sglist'"'
 	sreturn local k `"`k'"'
 	sreturn local ref  `"`ref'"'	
+	sreturn local sglab `"`sglab'"'			// either original value label, or tempname `sglab' if needed
 	sreturn local options `"`options'"'
 	
 end
@@ -891,21 +868,57 @@ end
 
 
 
-program define ProcessSavedData
+program define SavingClear
 
-	syntax anything, ///
-		study(name) subgroup(name) mainfile(string) ///
-		[AUGVARiance(real 1e5) SAVING(string asis) ] 
+	syntax anything, study(name) mainfile(string) sortorder(name) ///
+		[ SAVING(string asis) AUGVARiance(real 1e5) ] 
 	
 	tokenize `anything'
 	args GammaTable BetaTable
 	
-	local sgnoref : rownames `GammaTable'
-	local sglist : rownames `BetaTable'
+	// identify y-vars and S-vars relating to the reference subgroup
+	qui ds *_cons*
+	local vlist `"`r(varlist)'"'
+	local subgroup : variable label y_cons		// original, full name of `subgroup' (stored earlier)
+
+	// identify "abbreviated" form of `subgroup' used by -xi-
+	// from xi.ado:
+	// local name = substr("`pre'`base'",1,11) + "_"
+	// and if this name already exists, move on to [a-z][A-Z] in turn.
+	// therefore, end of string is (_|[a-z]|[A-Z])[1-9]+	
+	local Iyvars : rownames `BetaTable'
+	local Jyvars : rownames `GammaTable'
+	local k  : word count `Iyvars'
+	local k1 : word count `Jyvars'
+	assert `k1' == `k' - 1
+
+	local pre = 3		// length of prefix; here hard-coded as y_I or y_J
+	local i = 1
+	foreach name in `Iyvars' `Jyvars' {
+		local len = length(`"`name'"')
+		local j = 1
+		local el = substr(`"`name'"', -`j', `j')
+		cap confirm integer number `el'
+		while !_rc {
+			local el0 : copy local el
+			local ++j
+			local el = substr(`"`name'"', -`j', `j')
+			cap confirm integer number `el'
+		}
+		local n1 = `pre' + 1
+		local n2 = `len' - `pre' - `j'
+		local sgab = substr(`"`name'"', `n1', `n2')
+		cap assert `"`sgab'"'==substr(`"`subgroup'"', 1, `n2')
+		if _rc {
+			nois disp as err `"Something has gone wrong involving -xi-"'
+			exit 198
+		}
+		if `i' <= `k' local sglist `sglist' `el0'
+		else local sgnoref `sgnoref' `el0'
+		local ++i
+	}
 	local ref : list sglist - sgnoref
 	local r : list posof `"`ref'"' in sglist	
-	local k : word count `sglist'
-	local k1 = `k' - 1
 	
 	// insert missing reference row into `GammaTable' so that its elements match with those of `BetaTable'
 	if `r'==1 {
@@ -918,38 +931,35 @@ program define ProcessSavedData
 		local r1 = `r' - 1
 		matrix define `GammaTable' = `GammaTable'[1..`r1', 1..2] \ (., .) \ `GammaTable'[`r'..`k1', 1..2]
 	}
-	matrix rownames `GammaTable' = `sglist'
+	matrix rownames `GammaTable' = `sgnoref'
 	matrix colnames `GammaTable' = _yInt _yInt_S
-
-	// identify y-vars and S-vars relating to the reference subgroup
-	qui ds *_cons*
-	local vlist `"`r(varlist)'"'
-	local sgunab : variable label y_cons		// retrieve this, stored earlier
-
+	matrix rownames `BetaTable' = `sglist'
+	matrix colnames `BetaTable' = _y _y_S
+	
 	// prepare for reshape long, by replacing "_cons" with reference value
 	foreach x of local sglist {
 		if `x'==`ref' {
 			foreach v of local vlist {
-				local newname = subinstr(`"`v'"', `"_cons"', `"_J`subgroup'_`x'"', .)
+				local newname = subinstr(`"`v'"', `"_cons"', `"_J`sgab'_`x'"', .)
 				qui rename `v' `newname'
 			}
 		}
-		local rsvlist `rsvlist' S_J`subgroup'_@_J`subgroup'_`x'
+		local rsvlist `rsvlist' S_J`sgab'_@_J`sgab'_`x'
 	}
-	qui reshape long y_J`subgroup'_ `rsvlist', i(`study') j(`subgroup')
+	qui reshape long y_J`sgab'_ `rsvlist', i(`study') j(`sgab')
 	
-	qui gen double S_J`subgroup'_ = .
+	qui gen double S_J`sgab'_ = .
 	foreach x of local sglist {
 		if `x'!=`ref' {
-			qui replace S_J`subgroup'_ = S_J`subgroup'__J`subgroup'_`x' if `subgroup'==`x'
+			qui replace S_J`sgab'_ = S_J`sgab'__J`sgab'_`x' if `sgab'==`x'
 		}
-		drop S_J`subgroup'__J`subgroup'_`x'
+		drop S_J`sgab'__J`sgab'_`x'
 	}
-	qui replace y_J`subgroup'_ = .  if `subgroup'==`ref'
-	qui replace S_J`subgroup'_ = .  if `subgroup'==`ref'
-	
-	cap rename `subgroup' `sgunab'
-	qui merge 1:1 `study' `sgunab' using `mainfile', assert(match) nogen
+	qui replace y_J`sgab'_ = .  if `sgab'==`ref'
+	qui replace S_J`sgab'_ = .  if `sgab'==`ref'
+
+	cap rename `sgab' `subgroup'
+	qui merge 1:1 `study' `subgroup' using `mainfile', assert(match using) nogen
 	
 	local sglab : value label b
 	if `"`sglab'"'!=`""' {
@@ -957,8 +967,8 @@ program define ProcessSavedData
 		label values b
 	}
 	
-	// add in pooled estimates
-	tempvar pooled obs
+	// add in pooled estimates -- these are not study-specific (obviously!) so `sortorder' does not matter
+	tempvar pooled
 	qui gen byte `pooled' = 1
 	local oldN = _N
 	local newN = `oldN' + `k'
@@ -981,8 +991,8 @@ program define ProcessSavedData
 	
 	// -svmat- places results starting at the first observation
 	// so need to re-sort so that new observations are at the top, then re-sort again afterwards
-	qui gen `obs' = _n
-	sort `pooled' `obs'
+	qui isid `pooled' `sortorder' `subgroup', sort missok
+	qui replace `sortorder' = _n if missing(`sortorder')	// we are sorting by `pooled' first, so precise index values don't matter, just the ordering
 	
 	svmat `BetaTable', names(col)
 	qui replace b = _y if !`pooled'
@@ -990,19 +1000,19 @@ program define ProcessSavedData
 	drop _y _y_S
 	
 	svmat `GammaTable', names(col)
-	qui replace y_J`subgroup'_ = _yInt if !`pooled'
-	qui replace S_J`subgroup'_ = _yInt_S if !`pooled'
+	qui replace y_J`sgab'_ = _yInt if !`pooled'
+	qui replace S_J`sgab'_ = _yInt_S if !`pooled'
 	drop _yInt _yInt_S
 
 	qui replace `pooled' = 1 - `pooled'
-	sort `pooled' `obs'
-	drop `obs'
+	qui isid `pooled' `sortorder', sort missok
+	drop `sortorder'
 	
 	// use -metan- to restructure
-	qui rename y_J`subgroup'_ _yInt_ES
-	qui replace _yInt_ES = . if S_J`subgroup'_ >= `augvariance'
-	qui gen double _yInt_seES = sqrt(S_J`subgroup'_) if S_J`subgroup'_ < `augvariance'
-	drop S_J`subgroup'*
+	qui rename y_J`sgab'_ _yInt_ES
+	qui replace _yInt_ES = . if S_J`sgab'_ >= `augvariance'
+	qui gen double _yInt_seES = sqrt(S_J`sgab'_) if S_J`sgab'_ < `augvariance'
+	drop S_J`sgab'*
 	
 	qui replace b = . if V >= `augvariance'
 	qui gen double stderr = sqrt(V) if V < `augvariance'
@@ -1018,7 +1028,7 @@ program define ProcessSavedData
 	qui rename _y_BY _BY
 	qui rename _y_STUDY _STUDY
 	qui rename _y_LABELS _LABELS
-	
+
 	summ _BY if `pooled'==1, meanonly
 	qui replace `pooled' = (_BY==`r(min)')
 	
