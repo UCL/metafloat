@@ -8,7 +8,7 @@
 *  v0.8 beta  David Fisher 20sep2021
 *  v0.9 beta  David Fisher 14dec2021
 *  v0.10 beta  David Fisher 11jan2022
-*! v0.11 beta  David Fisher 03feb2022
+*! v0.11 beta  David Fisher 10feb2022
 
 
 *** METAFLOAT ***
@@ -32,6 +32,7 @@
 //       but since the parameterisation used by mvmeta_make is different, these matrices then need to be used in a slightly different way
 // v0.11: improvements to handling of `subgroup' as numeric/string
 //       fixed bug with saving/clear, where lack of data meant "interaction" dataset did not contain one or more studies in "main" dataset
+//       fixed bug which gave incorrect estimate of SigmaBeta under "randombeta" if ref was not first
 
 // TO DO:
 // debugging/test script
@@ -94,7 +95,7 @@ program define metafloat, eclass
 	// but currently no easy way to test for this
 
 	syntax varlist(numeric min=2 max=2) [if] [in], STUDY(varname) SUBGROUP(varname) ///
-		[ SHOWmodels DESign AUGVARiance(real 1e5) FORCEtrend ///
+		[ SHOWmodels DESign AUGVARiance(real 1e5) MTOL(real 1e-5) FORCEtrend ///
 		  LISTConstraints noUNCertainv PRINT(string) ///		/* -mvmeta- options */
 		  SAVING(passthru) CLEAR KEEPVars(varlist) * ]
 		
@@ -188,7 +189,7 @@ program define metafloat, eclass
 	
 	// Setup covariance structures
 	tempname sgmat propU
-	CovStruct `sgmat' `propU', k(`k') trans(`T') `s(options)'
+	CovStruct `sgmat' `propU', k(`k') /*trans(`T')*/ `s(options)'
 	local structure  `s(structure)'		// must be one of: fixed, unstructured, exchangeable, randombeta, wscorrzero
 	local sigmagamma `s(sigmagamma)'
 	local sigmabeta  `s(sigmabeta)'
@@ -259,7 +260,13 @@ program define metafloat, eclass
 		}
 	}
 	
-	local matexist : all matrices "S*"
+	local matexist
+	forvalues i=1/9 {
+		local matexisti : all matrices "S`i'*"
+		local matexist `matexist' `matexisti'
+		local matexisti : all matrices "y`i'*"
+		local matexist `matexist' `matexisti'
+	}
 	if `"`matexist'"'!=`""' {
 		nois disp `"{error}Note: the following matrices in memory will be cleared as a result of running this command:"'
 		nois disp `"{error}`matexist'"'
@@ -456,7 +463,11 @@ program define metafloat, eclass
 	// then L*(U`i' + SigmaU)*L' = S`i' + SigmaBeta ... and we need to sum these over all studies `i'
 	// The required matrices are available as _S* via the "keepmat" option to -mvmeta_make-
 	local n = e(N)							// number of trials
-	local Ulist : all matrices "S*"
+	local Ulist
+	forvalues i=1/9 {
+		local Ulisti : all matrices "S`i'*"
+		local Ulist `Ulist' `Ulisti'
+	}
 	assert `n'==`: word count `Ulist''
 	tempname SigmaU A W
 	matrix define `SigmaU' = e(Sigma)
@@ -466,6 +477,10 @@ program define metafloat, eclass
 		matrix define `A' = `A' + `ones''*invsym(`W')*`Z'
 	}
 	matrix define `A' = `Z' - `ones'*`VarThetaHat'*`A'
+	forvalues i=1/9 {
+		local Ulisti : all matrices "y`i'*"
+		local Ulist `Ulist' `Ulisti'
+	}	
 	matrix drop `Ulist'
 		
 	// ... and now correct VarThetaHat for uncertainty in the heterogeneity matrix if requested
@@ -486,6 +501,16 @@ program define metafloat, eclass
 	matrix define `SigmaBeta' = `T''*`L'*`SigmaU'*`L''*`T'
 	matrix coleq `SigmaBeta' = ""
 	matname `SigmaBeta' `Iyvars', explicit
+	
+	// check that M*SigmaBeta*M' = SigmaGamma
+	tempname M check
+	matrix define `M' = J(`k1', 1, -1), I(`k1')
+	matrix define `check' = `M' * `SigmaBeta' * `M''
+	cap assert mreldif(`check', `SigmaGamma') < `mtol'
+	if _rc {
+		nois disp as err "Something has gone wrong in the estimation of heterogeneity covariance matrices SigmaBeta and SigmaGamma"
+		exit 198
+	}
 	
 	// collect and display under "ereturn"
 	matrix define `BetaHat' = `BetaHat''
@@ -518,8 +543,8 @@ program define metafloat, eclass
 		matrix define `GammaTable' = `GammaHat'', vecdiag(`VarGammaHat')'
 		matrix define `BetaTable' = `BetaHat'', vecdiag(`VarBetaHat')'
 		
-		SavingClear `GammaTable' `BetaTable', study(`study') mainfile(`main_effects') sortorder(`sortorder') ///
-			saving(`saving') augvariance(`augvariance')
+		SavingClear `GammaTable' `BetaTable', `saving' study(`study') mainfile(`main_effects') ///
+			sortorder(`sortorder') augvariance(`augvariance')
 	
 		if `"`clear'"'!=`""' {
 			restore, not
@@ -533,6 +558,8 @@ program define metafloat, eclass
 	ereturn matrix VarGammaHat = `VarGammaHat'
 	ereturn matrix SigmaGamma  = `SigmaGamma'
 	ereturn matrix SigmaBeta   = `SigmaBeta'
+	ereturn hidden matrix SigmaU = `SigmaU'
+	ereturn hidden matrix T = `T'
 
 	ereturn scalar ThetaHat    = `ThetaHat'[1,1]
 	ereturn scalar VarThetaHat = `VarThetaHat'[1,1]
@@ -565,7 +592,7 @@ end
 
 // process covariance structures
 program define CovStruct, sclass
-	syntax anything, K(integer) TRANS(name) [ BSCOVariance(string) NAIVE ///
+	syntax anything, K(integer) /*TRANS(name)*/ [ BSCOVariance(string) NAIVE ///
 		FIXED UNStructured EXCHangeable RANDOMBeta WSCORRZero WSC0 * ]
 	
 	local soptions : copy local options
@@ -590,7 +617,7 @@ program define CovStruct, sclass
 	// parse pre-defined tempname matrices
 	tokenize `anything'
 	args sgmat propU
-	local T : copy local trans
+	// local T : copy local trans
 	
 	if `"`structure'"'=="fixed" {
 		local sigmagamma fixed
@@ -600,7 +627,7 @@ program define CovStruct, sclass
 		local sigmagamma fixed
 		matrix define `propU' = J(`k', `k', 0)
 		matrix define `propU'[`k', `k'] = 1
-		matrix define `propU' = `T''*`propU'*`T'
+		// matrix define `propU' = `T''*`propU'*`T'		// DF 10feb2022: `T' not needed; this matrix is used in a context where ref is *always* last, so 1 is *always* in k,k cell
 		local sigmabeta bscov(proportional `propU')
 	}		
 	else {
@@ -1043,6 +1070,7 @@ program define SavingClear
 	qui replace _y_WT = 100*_y_WT / r(sum) if !`pooled'
 	summ _y_WT if `pooled', meanonly
 	qui replace _y_WT = 100*_y_WT / r(sum) if `pooled'
+	qui drop `pooled'
 	
 	qui gen double _yInt_LCI = _yInt_ES - invnormal(.975)*_yInt_seES
 	qui gen double _yInt_UCI = _yInt_ES + invnormal(.975)*_yInt_seES
