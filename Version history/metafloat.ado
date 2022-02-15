@@ -8,7 +8,8 @@
 *  v0.8 beta  David Fisher 20sep2021
 *  v0.9 beta  David Fisher 14dec2021
 *  v0.10 beta  David Fisher 11jan2022
-*! v0.11 beta  David Fisher 10feb2022
+*  v0.11 beta  David Fisher 10feb2022
+*! v0.12 beta  David Fisher 15feb2022
 
 
 *** METAFLOAT ***
@@ -33,6 +34,7 @@
 // v0.11: improvements to handling of `subgroup' as numeric/string
 //       fixed bug with saving/clear, where lack of data meant "interaction" dataset did not contain one or more studies in "main" dataset
 //       fixed bug which gave incorrect estimate of SigmaBeta under "randombeta" if ref was not first
+// v0.12: improved handling of `design'; floating subgroups are now presented with reference to a particular "design" (i.e. available data in a particular set of subgroups)
 
 // TO DO:
 // debugging/test script
@@ -80,7 +82,7 @@ program define metafloat, eclass
 
 	// Check that -metan- v4.0+ is installed
 	cap metan
-	if "`r(metan_version)'"=="" {
+	if `"`r(metan_version)'"'==`""' {
 		nois disp as err "This program requires {bf:metan} version 4.04 or higher"
 		exit 499
 	}
@@ -95,10 +97,10 @@ program define metafloat, eclass
 	// but currently no easy way to test for this
 
 	syntax varlist(numeric min=2 max=2) [if] [in], STUDY(varname) SUBGROUP(varname) ///
-		[ SHOWmodels DESign AUGVARiance(real 1e5) MTOL(real 1e-5) FORCEtrend ///
+		[ SHOWmodels DESign DESignref(passthru) AUGVARiance(real 1e5) MTOL(real 1e-5) noTRend FORCEtrend ///
 		  LISTConstraints noUNCertainv PRINT(string) ///		/* -mvmeta- options */
 		  SAVING(passthru) CLEAR KEEPVars(varlist) * ]
-		
+	
 	_get_eformopts, eformopts(`options') allowed(__all__) soptions
 	local eformopt eform(`"`s(str)'"')
 	local soptions `"`s(options)'"'
@@ -176,9 +178,9 @@ program define metafloat, eclass
 	// - convert strings and non-integer subgroups to integers (saving original contents in value labels if appropriate)
 	// - obtain "design", i.e. which subgroups are present
 	// - also define trend vector `d' if appropriate
-	tempvar newsubgp desvar
+	tempvar newsubgp
 	tempname T d sglab
-	GetRef `study' `subgroup', newvars(`newsubgp' `desvar') sglab(`sglab') matrices(`T' `d') `design' `soptions'
+	GetRef `study' `subgroup', newvars(`newsubgp') sglab(`sglab') matrices(`T' `d') `design' `designref' `trend'
 	local k `s(k)'
 	local ref `s(ref)'
 	local sglab `s(sglab)'
@@ -186,10 +188,16 @@ program define metafloat, eclass
 		local trend notrend
 		local forcetrend
 	}
+	local designref
+	if `"`s(designref)'"'!=`""' {
+		local designref `"`s(designref)'"'
+		local collapse_opt collapse((firstnm) _Design)
+		// ^^ only needed for `design'; user-specified vars in keepvars() will be kept anyway via `main_effects'
+	}
 	
 	// Setup covariance structures
 	tempname sgmat propU
-	CovStruct `sgmat' `propU', k(`k') /*trans(`T')*/ `s(options)'
+	CovStruct `sgmat' `propU', k(`k') `soptions'
 	local structure  `s(structure)'		// must be one of: fixed, unstructured, exchangeable, randombeta, wscorrzero
 	local sigmagamma `s(sigmagamma)'
 	local sigmabeta  `s(sigmabeta)'
@@ -275,7 +283,7 @@ program define metafloat, eclass
 			
 
 	** Generate -mvmeta- dataset containing contrasts plus constant (reference subgroup)	
-	qui mvmeta_make regress b `usevars' [iw=V^-1], mse1 by(`study') keepmat clear nodetails useconstant
+	qui mvmeta_make regress b `usevars' [iw=V^-1], mse1 by(`study') keepmat clear nodetails useconstant `collapse_opt'
 	cap confirm numeric variable `Jyvars' y_cons
 	if _rc {
 		nois disp as err "Error: inconsistency in matrix stripe elements"
@@ -290,9 +298,9 @@ program define metafloat, eclass
 
 
 	** STEP 1: ESTIMATE INTERACTION (MEAN AND BS VARIANCE)
-	if "`design'"!="" local showmodels showmodels
-	if "`showmodels'"=="" local quietly quietly
-	if "`print'"=="" local print bscov
+	if `"`designref'"'!=`""' local showmodels showmodels
+	if `"`showmodels'"'==`""' local quietly quietly
+	if `"`print'"'==`""' local print bscov
 
 	// fit as standard model (assuming no trend)
 	tempname VarGammaHat GammaHat SigmaGamma Chol
@@ -394,24 +402,30 @@ program define metafloat, eclass
 	qui gen byte _Zero = 0
 	qui gen byte _One  = 1
 
-	// optionally adjust for "design" : use pre-defined variable `desvar' to derive set of indicators
-	if "`design'"!="" {
-		qui levelsof `desvar', local(dlist)
+	// optionally adjust for "design" : use pre-defined variable _Design to derive set of indicators
+	if `"`designref'"'!=`""' {
+		qui levelsof _Design, local(dlist)
 		local designvars
-		foreach d of local dlist {
-			local destxt = subinstr(trim(`"`d'"'), `" "', `"_"', .)
-			qui gen _Des_`destxt' = (`desvar'==`"`d'"')
-			local designvars `designvars' _Des_`destxt'
+		foreach di of local dlist {
+			local suffix = subinstr(trim(`"`di'"'), `" "', `"_"', .)
+			
+			// "reference" design (default is first design found)
+			if `"`di'"'==`"`designref'"' local desrefvar _Des_`suffix'
+			else {
+				qui gen byte _Des_`suffix' = (_Design==`"`di'"')
+				local designvars `designvars' _Des_`suffix'
+			}
 		}
-	}		
-
+		local zero _Zero
+	}
+	
 	local eqlist
 	local i = 0
 	tokenize `Jyvars'
 	while `"`1'"'!=`""' {
 	    local ++i
 		qui replace `1' = `1' - `GammaHat'[1, `i']
-		local eqlist `eqlist' `1':_Zero `designvars',
+		local eqlist `eqlist' `1':_Zero `zero',
 		macro shift
 	}
 	local eqlist equations(`eqlist' y_cons:_One `designvars')
@@ -432,7 +446,8 @@ program define metafloat, eclass
 	}
 	
 	// fit model: make sure we are using -mvmeta- version 3.5.1 # Ian White # 21dec2021 (or later)
-	if "`showmodels'"!="" nois disp as text _n `"Estimation of floating subgroup for reference category`trendtext':"'
+	if `"`showmodels'"'!=`""' nois disp as text _n `"Estimation of floating subgroup for reference category`trendtext':"'
+	order `study' y_cons		// so that y_cons is reported first
 	`quietly' mvmeta y S, print(`print') nocons commonparm `eqlist' `constr_opt' `sigmabeta' `soptions' `eformopt'
 	// Note: the coefficient of _cons refers to the reference subgroup
 	
@@ -453,11 +468,11 @@ program define metafloat, eclass
 	// First, derive `VarThetaHat' ignoring the uncertainty in the heterogeneity matrix
 	// because it's needed for deriving the matrix A...
 	tempname VarThetaHat
-	matrix define `VarThetaHat' = e(V)
+	matrix define `VarThetaHat' = e(V)	
 	matrix define `VarThetaHat' = invsym(`VarThetaHat')
 	matrix define `VarThetaHat' = `VarThetaHat'[1,1]
 	matrix define `VarThetaHat' = invsym(`VarThetaHat')	
-
+	
 	// Define matrix A, the independent multiplier of GammaHat
 	// In order to do this, we need to extract matrices U_i, where L * U_i * L' = S_i = diagonal matrix of subgroup-specific variances
 	// then L*(U`i' + SigmaU)*L' = S`i' + SigmaBeta ... and we need to sum these over all studies `i'
@@ -499,17 +514,25 @@ program define metafloat, eclass
 	// ...also applies to SigmaBeta
 	tempname SigmaBeta
 	matrix define `SigmaBeta' = `T''*`L'*`SigmaU'*`L''*`T'
-	matrix coleq `SigmaBeta' = ""
+	matrix coleq `SigmaBeta' = ""	// revisit diff between this and colon
 	matname `SigmaBeta' `Iyvars', explicit
 	
 	// check that M*SigmaBeta*M' = SigmaGamma
 	tempname M check
 	matrix define `M' = J(`k1', 1, -1), I(`k1')
-	matrix define `check' = `M' * `SigmaBeta' * `M''
-	cap assert mreldif(`check', `SigmaGamma') < `mtol'
+	matrix define `check' = `M'*`T'*`SigmaBeta'*`T''*`M''
+	matname `check' `: colnames `SigmaGamma'', explicit
+	local reldif = mreldif(`check', `SigmaGamma')
+	cap assert `reldif' < `mtol'
 	if _rc {
-		nois disp as err "Something has gone wrong in the estimation of heterogeneity covariance matrices SigmaBeta and SigmaGamma"
-		exit 198
+		if `"`naive'"'==`""' nois disp as err `"Something has gone wrong in the estimation of heterogeneity covariance matrices SigmaBeta and SigmaGamma"'
+		else nois disp `"{error}{bf:naive} option specified; check of relationship between SigmaBeta and SigmaGamma:"'
+		nois disp as err `"M*SigmaBeta*M' :"'
+		nois mat list `check'
+		nois disp as err `"SigmaGamma :"'
+		nois mat list `SigmaGamma'
+		nois disp as err `"Relative difference: `reldif'"'
+		if `"`naive'"'==`""' exit 198
 	}
 	
 	// collect and display under "ereturn"
@@ -534,7 +557,7 @@ program define metafloat, eclass
 		if `"`trend'"'==`""' {
 			drop _Trend*
 		}
-		if `"`design'"'!=`""' {
+		if `"`designref'"'!=`""' {
 			drop _Des*
 		}
 
@@ -579,7 +602,11 @@ program define metafloat, eclass
 	ereturn local bscov_Gamma `"`sigmagamma'"' 
 	ereturn local bscov_Beta `"`sigmabeta'"' 
 	
-	nois disp as text _n `"Floating subgroups`trendtext':"'
+	nois disp as text _n `"Floating subgroups:"' _c
+	if `"`designref'"'!=`""' {
+		nois disp as text `" (estimated under design: "' as res `"`desrefvar'"' as text `")"' _c
+	}
+	nois disp as text `"`trendtext'"'
 	ereturn display, `eformopt'
 
 	if `"`constr_list'"'!=`""' & `"`structure'"'!=`"user"' {	// only drop internally-defined constraints
@@ -592,7 +619,7 @@ end
 
 // process covariance structures
 program define CovStruct, sclass
-	syntax anything, K(integer) /*TRANS(name)*/ [ BSCOVariance(string) NAIVE ///
+	syntax anything, K(integer) [ BSCOVariance(string) NAIVE ///
 		FIXED UNStructured EXCHangeable RANDOMBeta WSCORRZero WSC0 * ]
 	
 	local soptions : copy local options
@@ -617,7 +644,6 @@ program define CovStruct, sclass
 	// parse pre-defined tempname matrices
 	tokenize `anything'
 	args sgmat propU
-	// local T : copy local trans
 	
 	if `"`structure'"'=="fixed" {
 		local sigmagamma fixed
@@ -627,7 +653,6 @@ program define CovStruct, sclass
 		local sigmagamma fixed
 		matrix define `propU' = J(`k', `k', 0)
 		matrix define `propU'[`k', `k'] = 1
-		// matrix define `propU' = `T''*`propU'*`T'		// DF 10feb2022: `T' not needed; this matrix is used in a context where ref is *always* last, so 1 is *always* in k,k cell
 		local sigmabeta bscov(proportional `propU')
 	}		
 	else {
@@ -638,7 +663,7 @@ program define CovStruct, sclass
 			local sigmagamma bscov(exchangeable .5)
 			
 			if `"`structure'"'=="wscorrzero" {
-				local sigmabeta bscov(equals `propU')	// matrix yet to be defined -- depends on SigmaGamma
+				local sigmabeta bscov(equals `propU')	// Note: matrix yet to be defined -- depends on SigmaGamma
 			}
 		}
 		else if `"`structure'"'==`""' {
@@ -663,16 +688,16 @@ end
 
 // Generate transformation matrix `T' based on choice of reference subgroup (= identity matrix if ref = 1st subgroup)
 // - convert strings and non-integer subgroups to integers (saving original contents in value labels if appropriate)
-// - obtain "design", i.e. which subgroups are present
+// - obtain "design", i.e. which subgroups are present (integer numeric only at the moment)
 // - also define trend vector `d' if appropriate
 program define GetRef, sclass
 
-	syntax varlist(min=2 max=2), newvars(namelist min=2 max=2) sglab(name) matrices(namelist min=2 max=2) [ DESign noTRend * ]
+	syntax varlist(min=2 max=2), newvars(namelist min=1 max=1) sglab(name) matrices(namelist min=2 max=2) [ DESign DESignref(string) noTRend ]
 	tokenize `varlist'
 	args study subgroup
 
 	tokenize `newvars'
-	args subgroup2 desvar
+	args subgroup2
 
 	* If `subgroup' is string (or contains non-integer values), convert to numeric so that later code runs smoothly
 	cap confirm numeric variable `subgroup'
@@ -700,6 +725,7 @@ program define GetRef, sclass
 		else local sglab : value label `subgroup'
 	}
 	else {	// string format found
+		local ok = 0
 		tempvar subgroup2
 		tempname sglab
 		qui encode `subgroup', gen(`subgroup2') label(`sglab')
@@ -714,14 +740,21 @@ program define GetRef, sclass
 	}
 	
 	* Sort out "design"
-	if `"`design'"'!=`""' {
+	if `"`design'"'!=`""' | `"`designref'"'!=`""' {
 		cap confirm variable _fillin
 		if _rc {
 			nois disp as err "variable {bf:_fillin} not found"
 			exit _rc
 		}
-		local desvar _Design
-		qui gen `desvar' = ""
+		cap gen _Design = ""
+		if _rc {
+			nois disp as err "cannot create variable {bf:_Design}; check if this variable already exists in memory, and rename"
+			exit _rc			
+		}
+		if !`ok' {
+			nois disp as err `"string-valued or non-integer subgroup variable currently not allowed with option {bf:design}; please convert to integer numeric"'
+			exit 198
+		}
 		
 		cap confirm numeric variable `study'
 		local string = _rc
@@ -729,13 +762,27 @@ program define GetRef, sclass
 		foreach s of local stlist {
 			if `string' {
 				qui levelsof `subgroup' if `study'==`"`s'"' & !_fillin, clean
-				qui replace `varlist' = `"`r(levels)'"' if `study'==`"`s'"'
+				qui replace _Design = `"`r(levels)'"' if `study'==`"`s'"'
 			}
 			else {
 				qui levelsof `subgroup' if `study'==`s' & !_fillin
-				qui replace `varlist' = `"`r(levels)'"' if `study'==`s'			
+				qui replace _Design = `"`r(levels)'"' if `study'==`s'
 			}
 		}
+		qui levelsof _Design, local(dlist)
+		if `: word count `dlist'' < 2 {
+			nois disp `"{error}Note: Only one design found; {bf:design} option will be ignored"'
+			c_local design
+			local designref
+		}
+		if `"`designref'"'!=`""' {
+			cap assert `: list posof `"`designref'"' in dlist'
+			if _rc {
+				nois disp as err `"Design {bf:`designref'} not found among included observations"'
+				exit 198
+			}
+		}
+		else gettoken designref : dlist
 	}
 	
 	* Sort out reference values and generate transformation matrix
@@ -796,9 +843,9 @@ program define GetRef, sclass
 	}
 	
 	sreturn local k `"`k'"'
-	sreturn local ref  `"`ref'"'	
+	sreturn local ref `"`ref'"'	
+	sreturn local designref `"`designref'"'	
 	sreturn local sglab `"`sglab'"'			// either original value label, or tempname `sglab' if needed
-	sreturn local options `"`options'"'
 	
 end
 
