@@ -9,7 +9,8 @@
 *  v0.9 beta  David Fisher 14dec2021
 *  v0.10 beta  David Fisher 11jan2022
 *  v0.11 beta  David Fisher 10feb2022
-*! v0.12 beta  David Fisher 15feb2022
+*  v0.12 beta  David Fisher 15feb2022
+*! v0.13 beta  David Fisher 05apr2022
 
 
 *** METAFLOAT ***
@@ -35,6 +36,7 @@
 //       fixed bug with saving/clear, where lack of data meant "interaction" dataset did not contain one or more studies in "main" dataset
 //       fixed bug which gave incorrect estimate of SigmaBeta under "randombeta" if ref was not first
 // v0.12: improved handling of `design'; floating subgroups are now presented with reference to a particular "design" (i.e. available data in a particular set of subgroups)
+// v0.13: fully compatible with Stata's -estimates- protocol
 
 // TO DO:
 // debugging/test script
@@ -80,527 +82,548 @@ program define metafloat, eclass
 	* NOTE: mata requires v9.x
 	* factor variable syntax requires 11.0
 
-	// Check that -metan- v4.0+ is installed
-	cap metan
-	if `"`r(metan_version)'"'==`""' {
-		nois disp as err "This program requires {bf:metan} version 4.04 or higher"
-		exit 499
+	if replay() {
+		if "`e(cmd)'"!="metafloat" {
+			error 301 /* last estimates not found */
+		}
 	}
+	
 	else {
-		local current_version = 4.04
-		if `r(metan_version)' < `current_version' {
+		// Check that -metan- v4.0+ is installed
+		cap metan
+		if `"`r(metan_version)'"'==`""' {
 			nois disp as err "This program requires {bf:metan} version 4.04 or higher"
 			exit 499
 		}
-	}
-	// NOTE: if random-effects, also requires -mvmeta- version 3.5.1 # Ian White # 21dec2021
-	// but currently no easy way to test for this
-
-	syntax varlist(numeric min=2 max=2) [if] [in], STUDY(varname) SUBGROUP(varname) ///
-		[ SHOWmodels DESign DESignref(passthru) AUGVARiance(real 1e5) MTOL(real 1e-5) noTRend FORCEtrend ///
-		  LISTConstraints noUNCertainv PRINT(string) ///		/* -mvmeta- options */
-		  SAVING(passthru) CLEAR KEEPVars(varlist) * ]
-	
-	_get_eformopts, eformopts(`options') allowed(__all__) soptions
-	local eformopt eform(`"`s(str)'"')
-	local soptions `"`s(options)'"'
-	marksample touse
-
-	
-	** Preserve data, prior to editing
-	preserve
-	qui keep if `touse' & !missing(`study', `subgroup')
-	keep `varlist' `study' `subgroup' `keepvars'
-		
-	tokenize `varlist'
-	args eff stderr
-
-	cap assert `stderr' >= 0
-	if _rc {
-		nois disp as err "Standard error cannot be negative"
-		exit 198
-	}
-	
-	// check that study-subgroup combinations are unique
-	tempvar obs Ngroup
-	qui gen int `obs' = _n
-	qui bysort `study' `subgroup' (`obs') : gen int `Ngroup' = _N
-	summ `Ngroup', meanonly
-	if r(max) > 1 {
-		nois disp as err "The following combination(s) of study and subgroup are not unique:"
-		nois list `study' `subgroup' `eff' `stderr' if `Ngroup' > 1
-		exit 198
-	}
-	drop `obs' `Ngroup'
-	
-	tempvar V
-	qui gen double `V' = `stderr'^2		// Generate estimate of the variance (s-squared)
-	drop `stderr'
-
-	capture {
-		if `"`eff'"'!=`"b"' {			// use {b, V} here, and {y, S} later with mvmeta_make
-			qui rename `eff' b
-		}
-		if `"`V'"'!=`"V"' {
-			qui rename `V' V
-		}
-	
-		// augment if missing subgroup data
-		qui fillin `study' `subgroup'
-		assert _fillin == missing(b)
-	}
-	if _rc {
-		nois disp as err `"Something that should be true of your data is not"'
-		nois disp as err `"In particular, variables {it:ES}, {it:seES}, {bf:study()} and {bf:subgroup()} must all be distinct"'
-		if `"`keepvars'"'!=`""' {
-			nois disp as err `"as should any variables in the {bf:keepvars()} option)"'
-		}
-		exit 459
-	}
-
-	// if any observed variances are larger than `augvariance'
-	//  (e.g. if estimated from very small sample)
-	// set to _fillin==2
-	qui replace _fillin = 2 if V > `augvariance'
-
-	summ _fillin, meanonly
-	if r(max) {
-		nois disp as text "The following subgroups are unobserved (or contain missing or extremely imprecise data)"
-		nois disp as text " and will be given augmented variances of " as res `augvariance' as text ":"
-		list `study' `subgroup' if _fillin
-	}
-	qui replace V = `augvariance' if _fillin
-	qui replace b = 0 if _fillin
-	
-	sreturn clear	// in advance of running s-class subroutines TransMatrix and CovStruct
-	
-	// Generate transformation matrix `T' based on choice of reference subgroup (= identity matrix if ref = 1st subgroup)
-	// - convert strings and non-integer subgroups to integers (saving original contents in value labels if appropriate)
-	// - obtain "design", i.e. which subgroups are present
-	// - also define trend vector `d' if appropriate
-	tempvar newsubgp
-	tempname T d sglab
-	GetRef `study' `subgroup', newvars(`newsubgp') sglab(`sglab') matrices(`T' `d') `design' `designref' `trend'
-	local k `s(k)'
-	local ref `s(ref)'
-	local sglab `s(sglab)'
-	if `k' < 3 {
-		local trend notrend
-		local forcetrend
-	}
-	local designref
-	if `"`s(designref)'"'!=`""' {
-		local designref `"`s(designref)'"'
-		local collapse_opt collapse((firstnm) _Design)
-		// ^^ only needed for `design'; user-specified vars in keepvars() will be kept anyway via `main_effects'
-	}
-	
-	// Setup covariance structures
-	tempname sgmat propU
-	CovStruct `sgmat' `propU', k(`k') `soptions'
-	local structure  `s(structure)'		// must be one of: fixed, unstructured, exchangeable, randombeta, wscorrzero
-	local sigmagamma `s(sigmagamma)'
-	local sigmabeta  `s(sigmabeta)'
-	local naive      `s(naive)'			// "naive" = undocumented option; don't constrain SigmaBeta and SigmaGamma to be linked
-	local soptions `"`s(options)'"'
-	
-	if `"`forcetrend'"'!=`""' {
-		cap assert inlist(`"`structure'"', "fixed", "randombeta") | `"`s(default)'"'!=`""'		// either "fixed" or "randombeta" specified, or no structure was specified
-		if _rc {
-			nois disp as err `"cannot specify {bf:bscovariance(`structure')} with {bf:forcetrend}; random-effects structure is implied by use of trend"'
-			exit 184
-		}
-	}
-		
-	// If saving/clear, then later we will need to merge on `subgroup'
-	// but it appears -merge- cannot keep its value label
-	// therefore, attach it to y instead, and retrieve it later
-	if `"`sglab'"'!=`""' {
-		label values b
-		label values b `sglab'
-	}
-	
-	// also save `study' variable label
-	local studylab : variable label `study'
-
-	if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
-		
-		// it is possible that, due to insufficient data, one or more studies may not be present after mvmeta_make
-		// therefore we will need to be careful when merging (see -SavingClear- )
-		// in particular, generate `sortorder' to guarantee the original order can always be recovered
-		tempvar sortorder
-		gen int `sortorder' = _n
-		
-		tempfile main_effects
-		qui save `main_effects'
-	}	
-	
-	// Generate contrasts, using prefix _J
-	// Note: y_cons is the reference subgroup (i.e NOT a contrast)
-	qui xi, noomit prefix(_J) i.`subgroup'
-	local OldVarsPrefix : char _dta[__xi__Vars__Prefix__]
-	local OldVarsToDrop: char _dta[__xi__Vars__To__Drop__]
-	local i = 0
-	foreach prefix of local OldVarsPrefix {
-		local ++i
-		if `"`prefix'"'==`"_J"' {
-			local el : word `i' of `OldVarsToDrop'
-			local VarsToDrop `VarsToDrop' `el'
-			local varlab : variable label `el'
-			tokenize `"`varlab'"', parse("=")
-			args sgname eq sgval
-			cap {
-				assert `"`sgname'"'==`"`subgroup'"'
-				assert `"`eq'"'==`"=="'
-				confirm number `sgval'
-				assert `"`4'"'==`""'
-			}
-			if _rc {
-				nois disp as err `"Something has gone wrong involving -xi-"'
-				exit 198
-			}
-			local Iyvar = subinstr(`"y`el'"', `"_J"', `"_I"', 1)
-			local Iyvars `Iyvars' `Iyvar'
-			if `sgval'!=`ref' {
-				local usevars `usevars' `el'
-				local Jyvars `Jyvars' y`el'
+		else {
+			local current_version = 4.04
+			if `r(metan_version)' < `current_version' {
+				nois disp as err "This program requires {bf:metan} version 4.04 or higher"
+				exit 499
 			}
 		}
-	}
-	
-	local matexist
-	forvalues i=1/9 {
-		local matexisti : all matrices "S`i'*"
-		local matexist `matexist' `matexisti'
-		local matexisti : all matrices "y`i'*"
-		local matexist `matexist' `matexisti'
-	}
-	if `"`matexist'"'!=`""' {
-		nois disp `"{error}Note: the following matrices in memory will be cleared as a result of running this command:"'
-		nois disp `"{error}`matexist'"'
-		matrix drop `matexist'
-	}
+		// NOTE: if random-effects, also requires -mvmeta- version 3.5.1 # Ian White # 21dec2021
+		// but currently no easy way to test for this
+
+		syntax varlist(numeric min=2 max=2) [if] [in], STUDY(varname) SUBGROUP(varname) ///
+			[ SHOWmodels DESign DESignref(passthru) AUGVARiance(real 1e5) MTOL(real 1e-5) noTRend FORCEtrend noMATDROP ///
+			  LISTConstraints noUNCertainv PRINT(string) ///		/* -mvmeta- options */
+			  SAVING(passthru) CLEAR KEEPVars(varlist) * ]
+		
+		_get_eformopts, eformopts(`options') allowed(__all__) soptions
+		local eformopt eform(`"`s(str)'"')
+		local soptions `"`s(options)'"'
+		marksample touse
+
+		
+		** Preserve data, prior to editing
+		preserve
+		qui keep if `touse' & !missing(`study', `subgroup')
+		keep `varlist' `study' `subgroup' `keepvars'
 			
+		tokenize `varlist'
+		args eff stderr
 
-	** Generate -mvmeta- dataset containing contrasts plus constant (reference subgroup)	
-	qui mvmeta_make regress b `usevars' [iw=V^-1], mse1 by(`study') keepmat clear nodetails useconstant `collapse_opt'
-	cap confirm numeric variable `Jyvars' y_cons
-	if _rc {
-		nois disp as err "Error: inconsistency in matrix stripe elements"
-		exit 198
-	}	
-
-	label variable `study' `"`studylab'"'
-	label variable y_cons `"`subgroup'"'
-
-	// N.B. regress ... [iw], mse1  is equivalent to using -vwls- 
-	//  but -regress, mse1- appears to be faster for some reason
-
-
-	** STEP 1: ESTIMATE INTERACTION (MEAN AND BS VARIANCE)
-	if `"`designref'"'!=`""' local showmodels showmodels
-	if `"`showmodels'"'==`""' local quietly quietly
-	if `"`print'"'==`""' local print bscov
-
-	// fit as standard model (assuming no trend)
-	tempname VarGammaHat GammaHat SigmaGamma Chol
-	nois disp as text _n "Test of interaction(s):"
-	`quietly' mvmeta y S, vars(`Jyvars') print(`print') `sigmagamma' `soptions' `eformopt'
-	cap assert `"`e(yvars)'"'==`"`Jyvars'"'
-	if _rc {
-		nois disp as err "Error: inconsistency in matrix stripe elements"
-		exit 198
-	}	
-	nois test `Jyvars'
-	local chi2_int = r(chi2)
-	local df_int = r(df)
-	local p_int = r(p)
-
-	local k1 = `k' - 1
-	matrix define `VarGammaHat' = e(V)[1..`k1', 1..`k1']
-	matrix define `GammaHat'    = e(b)[1,       1..`k1']
-	matrix define `SigmaGamma'  = e(Sigma)	
-	
-	// extract cholesky matrix of Sigma
-	if `"`structure'"'=="unstructured" {
-		// special case: if `unstructured', -mvmeta- outputs the elements of `Chol' as part of e(b)
-		// so don't bother packing them up into a matrix; we're only going to unpack them again later		
-		matrix define `Chol' = e(b)[1, `k'...]
-	}
-	else if inlist(`"`structure'"', "exchangeable", "wscorrzero") {
-		local tau = e(b)[1, `k']
-		cholesky2 `SigmaGamma' `Chol'
-		matrix define `Chol' = sign(`tau') * `Chol'
-	}
-	else if `"`structure'"'=="randombeta" {
-		matrix define `Chol' = J(`k1', `k1', 0)
-	}
-	
-	local rownames_eb : rownames e(b)
-	matrix rownames `GammaHat' = `: word 1 of `rownames_eb''	
-	matrix coleq `GammaHat' = :
-	matrix coleq `VarGammaHat' = :
-	matrix roweq `VarGammaHat' = :
-	
-	// if `k' > 2 (and unless `notrend'), also test for trend
-	local eqlist
-	if `"`trend'"'==`""' {
-		local i = 0		
-		tokenize `Jyvars'
-		while `"`1'"'!=`""' {
-			local ++i
-			qui gen _Trend_`i' = `d'[`i', 1]
-			local eqlist `eqlist' `1':_Trend_`i',
-			macro shift
+		cap assert `stderr' >= 0
+		if _rc {
+			nois disp as err "Standard error cannot be negative"
+			exit 198
 		}
 		
-		local sgammatrend fixed
-		if !inlist(`"`structure'"', "fixed", "randombeta") {
-			tempname D
-			matrix define `D' = `d'*`d''
-			local sgammatrend bscov(proportional `D')
+		// check that study-subgroup combinations are unique
+		tempvar obs Ngroup
+		qui gen int `obs' = _n
+		qui bysort `study' `subgroup' (`obs') : gen int `Ngroup' = _N
+		summ `Ngroup', meanonly
+		if r(max) > 1 {
+			nois disp as err "The following combination(s) of study and subgroup are not unique:"
+			nois list `study' `subgroup' `eff' `stderr' if `Ngroup' > 1
+			exit 198
+		}
+		drop `obs' `Ngroup'
+		
+		tempvar V
+		qui gen double `V' = `stderr'^2		// Generate estimate of the variance (s-squared)
+		drop `stderr'
+
+		capture {
+			if `"`eff'"'!=`"b"' {			// use {b, V} here, and {y, S} later with mvmeta_make
+				qui rename `eff' b
+			}
+			if `"`V'"'!=`"V"' {
+				qui rename `V' V
+			}
+		
+			// augment if missing subgroup data
+			qui fillin `study' `subgroup'
+			assert _fillin == missing(b)
+		}
+		if _rc {
+			nois disp as err `"Something that should be true of your data is not"'
+			nois disp as err `"In particular, variables {it:ES}, {it:seES}, {bf:study()} and {bf:subgroup()} must all be distinct"'
+			if `"`keepvars'"'!=`""' {
+				nois disp as err `"as should any variables in the {bf:keepvars()} option)"'
+			}
+			exit 459
 		}
 
-		nois disp as text _n "Test for trend:"
-		`quietly' mvmeta y S, vars(`Jyvars') print(`print') `sgammatrend' commonparm nocons equations(`eqlist') `soptions' `eformopt'
-		nois test _Trend_1
-		local chi2_trend = r(chi2)
-		local df_trend = r(df)
-		local p_trend = r(p)
+		// if any observed variances are larger than `augvariance'
+		//  (e.g. if estimated from very small sample)
+		// set to _fillin==2
+		qui replace _fillin = 2 if V > `augvariance'
+
+		summ _fillin, meanonly
+		if r(max) {
+			nois disp as text "The following subgroups are unobserved (or contain missing or extremely imprecise data)"
+			nois disp as text " and will be given augmented variances of " as res `augvariance' as text ":"
+			list `study' `subgroup' if _fillin
+		}
+		qui replace V = `augvariance' if _fillin
+		qui replace b = 0 if _fillin
+		
+		sreturn clear	// in advance of running s-class subroutines TransMatrix and CovStruct
+		
+		// Generate transformation matrix `T' based on choice of reference subgroup (= identity matrix if ref = 1st subgroup)
+		// - convert strings and non-integer subgroups to integers (saving original contents in value labels if appropriate)
+		// - obtain "design", i.e. which subgroups are present
+		// - also define trend vector `d' if appropriate
+		tempvar newsubgp
+		tempname T d sglab
+		GetRef `study' `subgroup', newvars(`newsubgp') sglab(`sglab') matrices(`T' `d') `design' `designref' `trend'
+		local k `s(k)'
+		local ref `s(ref)'
+		local sglab `s(sglab)'
+		if `k' < 3 {
+			local trend notrend
+			local forcetrend
+		}
+		local designref
+		if `"`s(designref)'"'!=`""' {
+			local designref `"`s(designref)'"'
+			local collapse_opt collapse((firstnm) _Design)
+			// ^^ only needed for `design'; user-specified vars in keepvars() will be kept anyway via `main_effects'
+		}
+		
+		// Setup covariance structures
+		tempname sgmat propU
+		CovStruct `sgmat' `propU', k(`k') `soptions'
+		local structure  `s(structure)'		// must be one of: fixed, unstructured, exchangeable, randombeta, wscorrzero
+		local sigmagamma `s(sigmagamma)'
+		local sigmabeta  `s(sigmabeta)'
+		local naive      `s(naive)'			// "naive" = undocumented option; don't constrain SigmaBeta and SigmaGamma to be linked
+		local soptions `"`s(options)'"'
 		
 		if `"`forcetrend'"'!=`""' {
-			matrix define `VarGammaHat' = e(V)[1, 1]		// Gamma is a constant if `trend'
-			matrix define `GammaHat'    = e(b)[1, 1]
-			matrix define `SigmaGamma'  = e(Sigma)
-
-			matrix define `VarGammaHat' = `VarGammaHat'*`d'*`d''
-			matrix define `GammaHat'    = `GammaHat'*`d''
+			cap assert inlist(`"`structure'"', "fixed", "randombeta") | `"`s(default)'"'!=`""'		// either "fixed" or "randombeta" specified, or no structure was specified
+			if _rc {
+				nois disp as err `"cannot specify {bf:bscovariance(`structure')} with {bf:forcetrend}; random-effects structure is implied by use of trend"'
+				exit 184
+			}
+		}
 			
-			if `"`structure'"'=="randombeta" {
-				matrix define `Chol' = J(`k1', `k1', 0)
-			}
-			else if `"`structure'"'!="fixed" {
-				local tau = e(b)[1, 2]
-				cholesky2 `SigmaGamma' `Chol'
-				matrix define `Chol' = sign(`tau') * `Chol'
-			}
-			local trendtext `" (with trend imposed)"'		// for later
+		// If saving/clear, then later we will need to merge on `subgroup'
+		// but it appears -merge- cannot keep its value label
+		// therefore, attach it to y instead, and retrieve it later
+		if `"`sglab'"'!=`""' {
+			label values b
+			label values b `sglab'
 		}
-	}	
-	cap assert `"`e(yvars)'"'==`"`Jyvars'"'
-	if _rc {
-		nois disp as err "Error: inconsistency in matrix stripe elements"
-		exit 198
-	}
+		
+		// also save `study' variable label
+		local studylab : variable label `study'
 
-
-	** STEP 2: ESTIMATE TREATMENT EFFECT IN REF GROUP (MEAN, BS VARIANCE AND BS CORRELATION WITH INTERACTIONS)
-	// subtract within-trial interactions from observed interaction data
-	// set up equations that make shifted interactions have mean zero
-
-	// Note: use permanent names so that they display nicely in the -mvmeta- output
-	qui gen byte _Zero = 0
-	qui gen byte _One  = 1
-
-	// optionally adjust for "design" : use pre-defined variable _Design to derive set of indicators
-	if `"`designref'"'!=`""' {
-		qui levelsof _Design, local(dlist)
-		local designvars
-		foreach di of local dlist {
-			local suffix = subinstr(trim(`"`di'"'), `" "', `"_"', .)
+		if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
 			
-			// "reference" design (default is first design found)
-			if `"`di'"'==`"`designref'"' local desrefvar _Des_`suffix'
-			else {
-				qui gen byte _Des_`suffix' = (_Design==`"`di'"')
-				local designvars `designvars' _Des_`suffix'
+			// it is possible that, due to insufficient data, one or more studies may not be present after mvmeta_make
+			// therefore we will need to be careful when merging (see -SavingClear- )
+			// in particular, generate `sortorder' to guarantee the original order can always be recovered
+			tempvar sortorder
+			gen int `sortorder' = _n
+			
+			tempfile main_effects
+			qui save `main_effects'
+		}	
+		
+		// Generate contrasts, using prefix _J
+		// Note: y_cons is the reference subgroup (i.e NOT a contrast)
+		qui xi, noomit prefix(_J) i.`subgroup'
+		local OldVarsPrefix : char _dta[__xi__Vars__Prefix__]
+		local OldVarsToDrop: char _dta[__xi__Vars__To__Drop__]
+		local i = 0
+		foreach prefix of local OldVarsPrefix {
+			local ++i
+			if `"`prefix'"'==`"_J"' {
+				local el : word `i' of `OldVarsToDrop'
+				local VarsToDrop `VarsToDrop' `el'
+				local varlab : variable label `el'
+				tokenize `"`varlab'"', parse("=")
+				args sgname eq sgval
+				cap {
+					assert `"`sgname'"'==`"`subgroup'"'
+					assert `"`eq'"'==`"=="'
+					confirm number `sgval'
+					assert `"`4'"'==`""'
+				}
+				if _rc {
+					nois disp as err `"Something has gone wrong involving -xi-"'
+					exit 198
+				}
+				local Iyvar = subinstr(`"y`el'"', `"_J"', `"_I"', 1)
+				local Iyvars `Iyvars' `Iyvar'
+				if `sgval'!=`ref' {
+					local usevars `usevars' `el'
+					local Jyvars `Jyvars' y`el'
+				}
 			}
 		}
-		local zero _Zero
-	}
-	
-	local eqlist
-	local i = 0
-	tokenize `Jyvars'
-	while `"`1'"'!=`""' {
-	    local ++i
-		qui replace `1' = `1' - `GammaHat'[1, `i']
-		local eqlist `eqlist' `1':_Zero `zero',
-		macro shift
-	}
-	local eqlist equations(`eqlist' y_cons:_One `designvars')
-	
-	// set up constraints on the BS variance of the interactions
-	// using the Cholesky matrix from STEP 1
-	if `"`structure'"'!="fixed" & `"`naive'"'==`""' {
-		SetupConstraints `Chol' `propU', k(`k') structure(`structure') `forcetrend'
-		local constr_list `s(constr_list)'
 		
-		if `"`constr_list'"'!=`""' {
-			if `"`listconstraints'"'!=`""' {
-				nois disp as text _n "Constraints on elements of Cholesky factor for SigmaU:"
-				nois constraint dir `constr_list'
-			}
-			local constr_opt constraints(`constr_list')
+		local matexist
+		forvalues i=1/9 {
+			local matexisti : all matrices "S`i'*"
+			local matexist `matexist' `matexisti'
+			local matexisti : all matrices "y`i'*"
+			local matexist `matexist' `matexisti'
 		}
-	}
-	
-	// fit model: make sure we are using -mvmeta- version 3.5.1 # Ian White # 21dec2021 (or later)
-	if `"`showmodels'"'!=`""' nois disp as text _n `"Estimation of floating subgroup for reference category`trendtext':"'
-	order `study' y_cons		// so that y_cons is reported first
-	`quietly' mvmeta y S, print(`print') nocons commonparm `eqlist' `constr_opt' `sigmabeta' `soptions' `eformopt'
-	// Note: the coefficient of _cons refers to the reference subgroup
-	
-	// Define covariate data matrix Z (arranged such that the reference subgroup comes first)
-	// Also define matrix L, which transforms "contrast + reference" parameterisation
-	// into "subgroup-specific" parameterisation
-	tempname ones Z L
-	matrix define `ones' = J(`k', 1, 1)			// column vector of ones, of length k
-	matrix define `Z' = J(`k', `k1', 0)
-	matrix define `Z'[2, 1] = I(`k1')	
-	matrix define `L' = `Z', `ones'
-	
-	// Compute implied means for beta
-	tempname ThetaHat BetaHat
-	matrix define `ThetaHat' = e(b)[1,1]
-	matrix define `BetaHat' = `ones'*`ThetaHat' + `Z'*`GammaHat''
-	
-	// First, derive `VarThetaHat' ignoring the uncertainty in the heterogeneity matrix
-	// because it's needed for deriving the matrix A...
-	tempname VarThetaHat
-	matrix define `VarThetaHat' = e(V)	
-	matrix define `VarThetaHat' = invsym(`VarThetaHat')
-	matrix define `VarThetaHat' = `VarThetaHat'[1,1]
-	matrix define `VarThetaHat' = invsym(`VarThetaHat')	
-	
-	// Define matrix A, the independent multiplier of GammaHat
-	// In order to do this, we need to extract matrices U_i, where L * U_i * L' = S_i = diagonal matrix of subgroup-specific variances
-	// then L*(U`i' + SigmaU)*L' = S`i' + SigmaBeta ... and we need to sum these over all studies `i'
-	// The required matrices are available as _S* via the "keepmat" option to -mvmeta_make-
-	local n = e(N)							// number of trials
-	local Ulist
-	forvalues i=1/9 {
-		local Ulisti : all matrices "S`i'*"
-		local Ulist `Ulist' `Ulisti'
-	}
-	assert `n'==`: word count `Ulist''
-	tempname SigmaU A W
-	matrix define `SigmaU' = e(Sigma)
-	matrix define `A' = J(1, `k1', 0)
-	foreach U of local Ulist {
-		matrix define `W' = `L'*(`U' + `SigmaU')*`L''
-		matrix define `A' = `A' + `ones''*invsym(`W')*`Z'
-	}
-	matrix define `A' = `Z' - `ones'*`VarThetaHat'*`A'
-	forvalues i=1/9 {
-		local Ulisti : all matrices "y`i'*"
-		local Ulist `Ulist' `Ulisti'
-	}	
-	matrix drop `Ulist'
+		if `"`matexist'"'!=`""' {
+			nois disp `"{error}Note: the following matrices in memory will be cleared as a result of running this command:"'
+			nois disp `"{error}`matexist'"'
+			matrix drop `matexist'
+		}
+
 		
-	// ... and now correct VarThetaHat for uncertainty in the heterogeneity matrix if requested
-	if `"`uncertainv'"'==`""' {
-		matrix define `VarThetaHat' = e(V)[1,1]
-	}
+		** Generate -mvmeta- dataset containing contrasts plus constant (reference subgroup)	
+		qui mvmeta_make regress b `usevars' [iw=V^-1], mse1 by(`study') keepmat clear nodetails useconstant `collapse_opt'
+		cap confirm numeric variable `Jyvars' y_cons
+		if _rc {
+			nois disp as err "Error: inconsistency in matrix stripe elements"
+			exit 198
+		}	
+
+		label variable `study' `"`studylab'"'
+		label variable y_cons `"`subgroup'"'
+
+		// N.B. regress ... [iw], mse1  is equivalent to using -vwls- 
+		//  but -regress, mse1- appears to be faster for some reason
+
 		
-	// correct variance for beta
-	tempname VarBetaHat
-	matrix define `VarBetaHat' = `VarThetaHat'*J(`k', `k', 1) + `A'*`VarGammaHat'*`A''
-	
-	// reverse transformation
-	matrix define `BetaHat'    = `T''*`BetaHat'
-	matrix define `VarBetaHat' = `T''*`VarBetaHat'*`T'
+		** STEP 1: ESTIMATE INTERACTION (MEAN AND BS VARIANCE)
+		if `"`designref'"'!=`""' local showmodels showmodels
+		if `"`showmodels'"'==`""' local quietly quietly
+		if `"`print'"'==`""' local print bscov
 
-	// ...also applies to SigmaBeta
-	tempname SigmaBeta
-	matrix define `SigmaBeta' = `T''*`L'*`SigmaU'*`L''*`T'
-	matrix coleq `SigmaBeta' = ""	// revisit diff between this and colon
-	matname `SigmaBeta' `Iyvars', explicit
-	
-	// check that M*SigmaBeta*M' = SigmaGamma
-	tempname M check
-	matrix define `M' = J(`k1', 1, -1), I(`k1')
-	matrix define `check' = `M'*`T'*`SigmaBeta'*`T''*`M''
-	matname `check' `: colnames `SigmaGamma'', explicit
-	local reldif = mreldif(`check', `SigmaGamma')
-	cap assert `reldif' < `mtol'
-	if _rc {
-		if `"`naive'"'==`""' nois disp as err `"Something has gone wrong in the estimation of heterogeneity covariance matrices SigmaBeta and SigmaGamma"'
-		else nois disp `"{error}{bf:naive} option specified; check of relationship between SigmaBeta and SigmaGamma:"'
-		nois disp as err `"M*SigmaBeta*M' :"'
-		nois mat list `check'
-		nois disp as err `"SigmaGamma :"'
-		nois mat list `SigmaGamma'
-		nois disp as err `"Relative difference: `reldif'"'
-		if `"`naive'"'==`""' exit 198
-	}
-	
-	// collect and display under "ereturn"
-	matrix define `BetaHat' = `BetaHat''
-	matrix coleq `BetaHat' = :
-	matname `BetaHat'    `Iyvars', columns(.) explicit
-	matname `VarBetaHat' `Iyvars', explicit
+		// fit as standard model (assuming no trend)
+		tempname VarGammaHat GammaHat SigmaGamma Chol
+		nois disp as text _n "Test of interaction(s):"
+		`quietly' mvmeta y S, vars(`Jyvars') print(`print') `sigmagamma' `soptions' `eformopt'
+		cap assert `"`e(yvars)'"'==`"`Jyvars'"'
+		if _rc {
+			nois disp as err "Error: inconsistency in matrix stripe elements"
+			exit 198
+		}	
+		nois test `Jyvars'
+		local chi2_int = r(chi2)
+		local df_int = r(df)
+		local p_int = r(p)
 
-	
-	*** Construct saved dataset
-	if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
+		local k1 = `k' - 1
+		matrix define `VarGammaHat' = e(V)[1..`k1', 1..`k1']
+		matrix define `GammaHat'    = e(b)[1,       1..`k1']
+		matrix define `SigmaGamma'  = e(Sigma)	
+		
+		// extract cholesky matrix of Sigma
+		if `"`structure'"'=="unstructured" {
+			// special case: if `unstructured', -mvmeta- outputs the elements of `Chol' as part of e(b)
+			// so don't bother packing them up into a matrix; we're only going to unpack them again later		
+			matrix define `Chol' = e(b)[1, `k'...]
+		}
+		else if inlist(`"`structure'"', "exchangeable", "wscorrzero") {
+			local tau = e(b)[1, `k']
+			cholesky2 `SigmaGamma' `Chol'
+			matrix define `Chol' = sign(`tau') * `Chol'
+		}
+		else if `"`structure'"'=="randombeta" {
+			matrix define `Chol' = J(`k1', `k1', 0)
+		}
+		
+		local rownames_eb : rownames e(b)
+		matrix rownames `GammaHat' = `: word 1 of `rownames_eb''	
+		matrix coleq `GammaHat' = :
+		matrix coleq `VarGammaHat' = :
+		matrix roweq `VarGammaHat' = :
+		
+		// if `k' > 2 (and unless `notrend'), also test for trend
+		local eqlist
+		if `"`trend'"'==`""' {
+			local i = 0		
+			tokenize `Jyvars'
+			while `"`1'"'!=`""' {
+				local ++i
+				qui gen _Trend_`i' = `d'[`i', 1]
+				local eqlist `eqlist' `1':_Trend_`i',
+				macro shift
+			}
+			
+			local sgammatrend fixed
+			if !inlist(`"`structure'"', "fixed", "randombeta") {
+				tempname D
+				matrix define `D' = `d'*`d''
+				local sgammatrend bscov(proportional `D')
+			}
 
-		// reverse previous operation
+			nois disp as text _n "Test for trend:"
+			`quietly' mvmeta y S, vars(`Jyvars') print(`print') `sgammatrend' commonparm nocons equations(`eqlist') `soptions' `eformopt'
+			nois test _Trend_1
+			local chi2_trend = r(chi2)
+			local df_trend = r(df)
+			local p_trend = r(p)
+			
+			if `"`forcetrend'"'!=`""' {
+				matrix define `VarGammaHat' = e(V)[1, 1]		// Gamma is a constant if `trend'
+				matrix define `GammaHat'    = e(b)[1, 1]
+				matrix define `SigmaGamma'  = e(Sigma)
+
+				matrix define `VarGammaHat' = `VarGammaHat'*`d'*`d''
+				matrix define `GammaHat'    = `GammaHat'*`d''
+				
+				if `"`structure'"'=="randombeta" {
+					matrix define `Chol' = J(`k1', `k1', 0)
+				}
+				else if `"`structure'"'!="fixed" {
+					local tau = e(b)[1, 2]
+					cholesky2 `SigmaGamma' `Chol'
+					matrix define `Chol' = sign(`tau') * `Chol'
+				}
+				local trendtext `" (with trend imposed)"'		// for later
+			}
+		}	
+		cap assert `"`e(yvars)'"'==`"`Jyvars'"'
+		if _rc {
+			nois disp as err "Error: inconsistency in matrix stripe elements"
+			exit 198
+		}
+
+
+		** STEP 2: ESTIMATE TREATMENT EFFECT IN REF GROUP (MEAN, BS VARIANCE AND BS CORRELATION WITH INTERACTIONS)
+		// subtract within-trial interactions from observed interaction data
+		// set up equations that make shifted interactions have mean zero
+
+		// Note: use permanent names so that they display nicely in the -mvmeta- output
+		qui gen byte _Zero = 0
+		qui gen byte _One  = 1
+
+		// optionally adjust for "design" : use pre-defined variable _Design to derive set of indicators
+		if `"`designref'"'!=`""' {
+			qui levelsof _Design, local(dlist)
+			local designvars
+			foreach di of local dlist {
+				local suffix = subinstr(trim(`"`di'"'), `" "', `"_"', .)
+				
+				// "reference" design (default is first design found)
+				if `"`di'"'==`"`designref'"' local desrefvar _Des_`suffix'
+				else {
+					qui gen byte _Des_`suffix' = (_Design==`"`di'"')
+					local designvars `designvars' _Des_`suffix'
+				}
+			}
+			local zero _Zero
+		}
+		
+		local eqlist
 		local i = 0
 		tokenize `Jyvars'
 		while `"`1'"'!=`""' {
 			local ++i
-			qui replace `1' = `1' + `GammaHat'[1, `i']
+			qui replace `1' = `1' - `GammaHat'[1, `i']
+			local eqlist `eqlist' `1':_Zero `zero',
 			macro shift
 		}
-		drop _Zero _One
-		if `"`trend'"'==`""' {
-			drop _Trend*
-		}
-		if `"`designref'"'!=`""' {
-			drop _Des*
-		}
-
-		// generate matrices containing pooled estimates and variances
-		tempname BetaTable GammaTable
-		matrix define `GammaTable' = `GammaHat'', vecdiag(`VarGammaHat')'
-		matrix define `BetaTable' = `BetaHat'', vecdiag(`VarBetaHat')'
+		local eqlist equations(`eqlist' y_cons:_One `designvars')
 		
-		SavingClear `GammaTable' `BetaTable', `saving' study(`study') mainfile(`main_effects') ///
-			sortorder(`sortorder') augvariance(`augvariance')
-	
-		if `"`clear'"'!=`""' {
-			restore, not
+		// set up constraints on the BS variance of the interactions
+		// using the Cholesky matrix from STEP 1
+		if `"`structure'"'!="fixed" & `"`naive'"'==`""' {
+			SetupConstraints `Chol' `propU', k(`k') structure(`structure') `forcetrend'
+			local constr_list `s(constr_list)'
+			
+			if `"`constr_list'"'!=`""' {
+				if `"`listconstraints'"'!=`""' {
+					nois disp as text _n "Constraints on elements of Cholesky factor for SigmaU:"
+					nois constraint dir `constr_list'
+				}
+				local constr_opt constraints(`constr_list')
+			}
 		}
-	}
-	
-	
-	*** Finally, present the results
-	ereturn post `BetaHat' `VarBetaHat', depname(Subgroup)
-	ereturn matrix GammaHat    = `GammaHat'
-	ereturn matrix VarGammaHat = `VarGammaHat'
-	ereturn matrix SigmaGamma  = `SigmaGamma'
-	ereturn matrix SigmaBeta   = `SigmaBeta'
-	ereturn hidden matrix SigmaU = `SigmaU'
-	ereturn hidden matrix T = `T'
+		
+		// fit model: make sure we are using -mvmeta- version 3.5.1 # Ian White # 21dec2021 (or later)
+		if `"`showmodels'"'!=`""' nois disp as text _n `"Estimation of floating subgroup for reference category`trendtext':"'
+		// order `study' y_cons		// so that y_cons is reported first -- DF 01apr2022 can't do this as it messes with estimation
+		`quietly' mvmeta y S, print(`print') nocons commonparm `eqlist' `constr_opt' `sigmabeta' `soptions' `eformopt'
+		// Note: the coefficient of _cons refers to the reference subgroup
+		if `"`constr_list'"'!=`""' {	// only drop internally-defined constraints
+			constraint drop `constr_list'
+		}
+		
+		// Define covariate data matrix Z (arranged such that the reference subgroup comes first)
+		// Also define matrix L, which transforms "contrast + reference" parameterisation
+		// into "subgroup-specific" parameterisation
+		tempname ones Z L
+		matrix define `ones' = J(`k', 1, 1)			// column vector of ones, of length k
+		matrix define `Z' = J(`k', `k1', 0)
+		matrix define `Z'[2, 1] = I(`k1')	
+		matrix define `L' = `Z', `ones'
+		
+		// Compute implied means for beta
+		tempname ThetaHat BetaHat
+		matrix define `ThetaHat' = e(b)[1,1]
+		matrix define `BetaHat' = `ones'*`ThetaHat' + `Z'*`GammaHat''
+		
+		// First, derive `VarThetaHat' ignoring the uncertainty in the heterogeneity matrix
+		// because it's needed for deriving the matrix A...
+		tempname VarThetaHat
+		matrix define `VarThetaHat' = e(V)	
+		matrix define `VarThetaHat' = invsym(`VarThetaHat')
+		matrix define `VarThetaHat' = `VarThetaHat'[1,1]
+		matrix define `VarThetaHat' = invsym(`VarThetaHat')	
+		
+		// Define matrix A, the independent multiplier of GammaHat
+		// In order to do this, we need to extract matrices U_i, where L * U_i * L' = S_i = diagonal matrix of subgroup-specific variances
+		// then L*(U`i' + SigmaU)*L' = S`i' + SigmaBeta ... and we need to sum these over all studies `i'
+		// The required matrices are available as S* via the "keepmat" option to -mvmeta_make-
+		local n = e(N)							// number of trials
+		local Ulist
+		forvalues i=1/9 {
+			local Ulisti : all matrices "S`i'*"
+			local Ulist `Ulist' `Ulisti'		// note that these are *not* in any particular order; e.g. S10 will come before S2
+		}										// ...but that doesn't matter because we're just summing them
+		assert `n'==`: word count `Ulist''
+		tempname SigmaU A W
+		matrix define `SigmaU' = e(Sigma)
+		// matrix define `A' = J(1, `k1', 0)
+		matrix define `A' = J(`k', `k', 0)
+		foreach U of local Ulist {
+			matrix define `W' = `L'*(`U' + `SigmaU')*`L''
+			// matrix define `A' = `A' + `ones''*invsym(`W')*`Z'
+			matrix define `A' = `A' + invsym(`W')
+		}
+		// matrix define `A' = `Z' - `ones'*`VarThetaHat'*`A'
+		matrix define `A' = `Z' - `VarThetaHat'*J(`k', `k', 1)*`A'*`Z'
 
-	ereturn scalar ThetaHat    = `ThetaHat'[1,1]
-	ereturn scalar VarThetaHat = `VarThetaHat'[1,1]
-	ereturn scalar n = `n'		// number of studies
-	ereturn scalar k = `k'		// number of subgroups
+		if `"`nomatdrop'"'!=`""' {
+			forvalues i=1/9 {
+				local Ulisti : all matrices "y`i'*"
+				local Ulist `Ulist' `Ulisti'
+			}
+			matrix drop `Ulist'
+		}
+			
+		// ... and now correct VarThetaHat for uncertainty in the heterogeneity matrix if requested
+		if `"`uncertainv'"'==`""' {
+			matrix define `VarThetaHat' = e(V)[1,1]
+		}
+			
+		// correct variance for beta
+		tempname VarBetaHat
+		matrix define `VarBetaHat' = `VarThetaHat'*J(`k', `k', 1) + `A'*`VarGammaHat'*`A''
+		
+		// reverse transformation
+		matrix define `BetaHat'    = `T''*`BetaHat'
+		matrix define `VarBetaHat' = `T''*`VarBetaHat'*`T'
 
-	ereturn scalar chi2_int = `chi2_int'
-	ereturn scalar df_int = `df_int'
-	ereturn scalar p_int = `p_int'
-	
-	if `"`trend'"'==`""' {
-		ereturn scalar chi2_trend = `chi2_trend'
-		ereturn scalar df_trend = `df_trend'
-		ereturn scalar p_trend = `p_trend'
+		// ...also applies to SigmaBeta
+		tempname SigmaBeta
+		matrix define `SigmaBeta' = `T''*`L'*`SigmaU'*`L''*`T'
+		matrix coleq `SigmaBeta' = ""	// revisit diff between this and colon
+		matname `SigmaBeta' `Iyvars', explicit
+		
+		// check that M*SigmaBeta*M' = SigmaGamma
+		tempname M check
+		matrix define `M' = J(`k1', 1, -1), I(`k1')
+		matrix define `check' = `M'*`T'*`SigmaBeta'*`T''*`M''
+		matname `check' `: colnames `SigmaGamma'', explicit
+		local reldif = mreldif(`check', `SigmaGamma')
+		cap assert `reldif' < `mtol'
+		if _rc {
+			if `"`naive'"'==`""' nois disp as err `"Something has gone wrong in the estimation of heterogeneity covariance matrices SigmaBeta and SigmaGamma"'
+			else nois disp `"{error}{bf:naive} option specified; check of relationship between SigmaBeta and SigmaGamma:"'
+			nois disp as err `"M*SigmaBeta*M' :"'
+			nois mat list `check'
+			nois disp as err `"SigmaGamma :"'
+			nois mat list `SigmaGamma'
+			nois disp as err `"Relative difference: `reldif'"'
+			if `"`naive'"'==`""' exit 198
+		}
+		
+		// collect and display under "ereturn"
+		matrix define `BetaHat' = `BetaHat''
+		matrix coleq `BetaHat' = :
+		matname `BetaHat'    `Iyvars', columns(.) explicit
+		matname `VarBetaHat' `Iyvars', explicit
+
+		
+		*** Construct saved dataset
+		if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
+
+			// reverse previous operation
+			local i = 0
+			tokenize `Jyvars'
+			while `"`1'"'!=`""' {
+				local ++i
+				qui replace `1' = `1' + `GammaHat'[1, `i']
+				macro shift
+			}
+			drop _Zero _One
+			if `"`trend'"'==`""' {
+				drop _Trend*
+			}
+			if `"`designref'"'!=`""' {
+				drop _Des*
+			}
+
+			// generate matrices containing pooled estimates and variances
+			tempname BetaTable GammaTable
+			matrix define `GammaTable' = `GammaHat'', vecdiag(`VarGammaHat')'
+			matrix define `BetaTable' = `BetaHat'', vecdiag(`VarBetaHat')'
+			
+			SavingClear `GammaTable' `BetaTable', `saving' study(`study') mainfile(`main_effects') ///
+				sortorder(`sortorder') augvariance(`augvariance')
+		
+			if `"`clear'"'!=`""' {
+				restore, not
+			}
+		}
+		
+		
+		*** Finally, present the results
+		ereturn post `BetaHat' `VarBetaHat', depname(Subgroup)
+		ereturn matrix GammaHat    = `GammaHat'
+		ereturn matrix VarGammaHat = `VarGammaHat'
+		ereturn matrix SigmaGamma  = `SigmaGamma'
+		ereturn matrix SigmaBeta   = `SigmaBeta'
+		ereturn hidden matrix SigmaU = `SigmaU'
+		ereturn hidden matrix A = `A'
+		ereturn hidden matrix T = `T'
+
+		ereturn scalar ThetaHat    = `ThetaHat'[1,1]
+		ereturn scalar VarThetaHat = `VarThetaHat'[1,1]
+		ereturn scalar n = `n'		// number of studies
+		ereturn scalar k = `k'		// number of subgroups
+
+		ereturn scalar chi2_int = `chi2_int'
+		ereturn scalar df_int = `df_int'
+		ereturn scalar p_int = `p_int'
+		
+		if `"`trend'"'==`""' {
+			ereturn scalar chi2_trend = `chi2_trend'
+			ereturn scalar df_trend = `df_trend'
+			ereturn scalar p_trend = `p_trend'
+		}
+		
+		ereturn local bscov_Gamma `"`sigmagamma'"' 
+		ereturn local bscov_Beta `"`sigmabeta'"'
+		
+		ereturn local cmdline `"metafloat `0'"'
+		ereturn local cmd metafloat
 	}
-	
-	ereturn local bscov_Gamma `"`sigmagamma'"' 
-	ereturn local bscov_Beta `"`sigmabeta'"' 
 	
 	nois disp as text _n `"Floating subgroups:"' _c
 	if `"`designref'"'!=`""' {
@@ -608,10 +631,6 @@ program define metafloat, eclass
 	}
 	nois disp as text `"`trendtext'"'
 	ereturn display, `eformopt'
-
-	if `"`constr_list'"'!=`""' & `"`structure'"'!=`"user"' {	// only drop internally-defined constraints
-	    constraint drop `constr_list'
-	}
 	
 end
 
@@ -930,7 +949,7 @@ program define SetupConstraints, sclass
 		matrix define `LinvT'[`k', 1] = J(1, `k1', -1) 
 		matrix define `LinvT'[`k', `k'] = 1
 
-		matrix define `propU' = ((`tau')^2)*`LinvT'
+		matrix define `propU' = .5*((`tau')^2)*`LinvT'
 	}
 	
 	// constraint 4 y_Isubgroup_2=0
