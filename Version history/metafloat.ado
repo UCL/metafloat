@@ -10,7 +10,8 @@
 *  v0.10 beta  David Fisher 11jan2022
 *  v0.11 beta  David Fisher 10feb2022
 *  v0.12 beta  David Fisher 15feb2022
-*! v0.13 beta  David Fisher 05apr2022
+*  v0.13 beta  David Fisher 05apr2022
+*! v0.14 beta  David Fisher 07jul2022
 
 
 *** METAFLOAT ***
@@ -37,6 +38,7 @@
 //       fixed bug which gave incorrect estimate of SigmaBeta under "randombeta" if ref was not first
 // v0.12: improved handling of `design'; floating subgroups are now presented with reference to a particular "design" (i.e. available data in a particular set of subgroups)
 // v0.13: fully compatible with Stata's -estimates- protocol
+// v0.14: string-valued study() variables automatically converted to numeric, to avoid errors in -mvmeta_make-
 
 // TO DO:
 // debugging/test script
@@ -185,11 +187,12 @@ program define metafloat, eclass
 		
 		// Generate transformation matrix `T' based on choice of reference subgroup (= identity matrix if ref = 1st subgroup)
 		// - convert strings and non-integer subgroups to integers (saving original contents in value labels if appropriate)
+		// - also do the same for `study'; string values can cause problems for -mvmeta_make-
 		// - obtain "design", i.e. which subgroups are present
 		// - also define trend vector `d' if appropriate
-		tempvar newsubgp
-		tempname T d sglab
-		GetRef `study' `subgroup', newvars(`newsubgp') sglab(`sglab') matrices(`T' `d') `design' `designref' `trend'
+		tempvar newstudy newsubgp
+		tempname T d sg2lab st2lab
+		GetRef `study' `subgroup', newvars(`newstudy' `newsubgp') newlabs(`sg2lab' `st2lab') matrices(`T' `d') `design' `designref' `trend'
 		local k `s(k)'
 		local ref `s(ref)'
 		local sglab `s(sglab)'
@@ -466,8 +469,9 @@ program define metafloat, eclass
 		// Define covariate data matrix Z (arranged such that the reference subgroup comes first)
 		// Also define matrix L, which transforms "contrast + reference" parameterisation
 		// into "subgroup-specific" parameterisation
-		tempname ones Z L
+		tempname ones onesJ Z L
 		matrix define `ones' = J(`k', 1, 1)			// column vector of ones, of length k
+		matrix define `onesJ' = J(`k', `k', 1)		// k by k matrix full of ones
 		matrix define `Z' = J(`k', `k1', 0)
 		matrix define `Z'[2, 1] = I(`k1')	
 		matrix define `L' = `Z', `ones'
@@ -498,17 +502,14 @@ program define metafloat, eclass
 		assert `n'==`: word count `Ulist''
 		tempname SigmaU A W
 		matrix define `SigmaU' = e(Sigma)
-		// matrix define `A' = J(1, `k1', 0)
 		matrix define `A' = J(`k', `k', 0)
 		foreach U of local Ulist {
 			matrix define `W' = `L'*(`U' + `SigmaU')*`L''
-			// matrix define `A' = `A' + `ones''*invsym(`W')*`Z'
 			matrix define `A' = `A' + invsym(`W')
 		}
-		// matrix define `A' = `Z' - `ones'*`VarThetaHat'*`A'
-		matrix define `A' = `Z' - `VarThetaHat'*J(`k', `k', 1)*`A'*`Z'
+		matrix define `A' = `Z' - `VarThetaHat'*`onesJ'*`A'*`Z'
 
-		if `"`nomatdrop'"'!=`""' {
+		if `"`matdrop'"'==`""' {
 			forvalues i=1/9 {
 				local Ulisti : all matrices "y`i'*"
 				local Ulist `Ulist' `Ulisti'
@@ -523,7 +524,7 @@ program define metafloat, eclass
 			
 		// correct variance for beta
 		tempname VarBetaHat
-		matrix define `VarBetaHat' = `VarThetaHat'*J(`k', `k', 1) + `A'*`VarGammaHat'*`A''
+		matrix define `VarBetaHat' = `VarThetaHat'*`onesJ' + `A'*`VarGammaHat'*`A''
 		
 		// reverse transformation
 		matrix define `BetaHat'    = `T''*`BetaHat'
@@ -711,26 +712,43 @@ end
 // - also define trend vector `d' if appropriate
 program define GetRef, sclass
 
-	syntax varlist(min=2 max=2), newvars(namelist min=1 max=1) sglab(name) matrices(namelist min=2 max=2) [ DESign DESignref(string) noTRend ]
+	syntax varlist(min=2 max=2), newvars(namelist min=2 max=2) newlabs(namelist min=2 max=2) matrices(namelist min=2 max=2) ///
+		[ DESign DESignref(string) noTRend ]
+	
 	tokenize `varlist'
 	args study subgroup
-
 	tokenize `newvars'
-	args subgroup2
+	args study2 subgroup2
+	tokenize `newlabs'
+	args st2lab sg2lab
 
+	* If `study' is string (or contains non-integer values), convert to numeric so that -mvmeta_make- runs smoothly
+	cap confirm numeric variable `study'
+	if !_rc {
+		cap assert `study'==int(`study')
+		if _rc {	// non-integer values found
+			egen `study2' = group(`study'), label(`st2lab')
+			qui drop `study'
+			qui rename `study2' `study'
+		}
+	}
+	else {	// string format found
+		qui encode `study', gen(`study2') label(`st2lab')
+		qui drop `study'
+		qui rename `study2' `study'
+	}	
+	
 	* If `subgroup' is string (or contains non-integer values), convert to numeric so that later code runs smoothly
 	cap confirm numeric variable `subgroup'
 	if !_rc {
 		local ok = 1
 		qui levelsof `subgroup', local(sglist)
 		foreach val of local sglist {
-			cap assert `val' == int(`val')
+			cap confirm integer number `val'
 			if _rc local ok = 0
 		}
 		if !`ok' {	// non-integer values found
-			tempvar subgroup2
-			tempname sglab
-			egen `subgroup2' = group(`subgroup'), label(`sglab')
+			egen `subgroup2' = group(`subgroup'), label(`sg2lab')
 			local sgomit : char `subgroup'[omit]
 			if `"`sgomit'"'!=`""' {
 				confirm number `sgomit'
@@ -741,13 +759,11 @@ program define GetRef, sclass
 			qui rename `subgroup2' `subgroup'
 			qui levelsof `subgroup', local(sglist)
 		}
-		else local sglab : value label `subgroup'
+		else local sg2lab : value label `subgroup'
 	}
 	else {	// string format found
 		local ok = 0
-		tempvar subgroup2
-		tempname sglab
-		qui encode `subgroup', gen(`subgroup2') label(`sglab')
+		qui encode `subgroup', gen(`subgroup2') label(`sg2lab')
 		local sgomit : char `subgroup'[omit]
 		if `"`sgomit'"'!=`""' {
 			summ `subgroup2' if `subgroup'==`"`sgomit'"', meanonly
@@ -864,7 +880,7 @@ program define GetRef, sclass
 	sreturn local k `"`k'"'
 	sreturn local ref `"`ref'"'	
 	sreturn local designref `"`designref'"'	
-	sreturn local sglab `"`sglab'"'			// either original value label, or tempname `sglab' if needed
+	sreturn local sglab `"`sg2lab'"'		// either original value label, or tempname `sg2lab' if needed
 	
 end
 
