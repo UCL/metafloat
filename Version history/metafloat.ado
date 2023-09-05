@@ -11,7 +11,8 @@
 *  v0.11 beta  David Fisher 10feb2022
 *  v0.12 beta  David Fisher 15feb2022
 *  v0.13 beta  David Fisher 05apr2022
-*! v0.14 beta  David Fisher 07jul2022
+*  v0.14 beta  David Fisher 07jul2022
+*! v0.15 beta  David Fisher 30aug2023
 
 
 *** METAFLOAT ***
@@ -39,6 +40,7 @@
 // v0.12: improved handling of `design'; floating subgroups are now presented with reference to a particular "design" (i.e. available data in a particular set of subgroups)
 // v0.13: fully compatible with Stata's -estimates- protocol
 // v0.14: string-valued study() variables automatically converted to numeric, to avoid errors in -mvmeta_make-
+// v0.15: fixed minor bug which meant variable label of "subgroup" was lost (and hence not displayed in forest plot)
 
 // TO DO:
 // debugging/test script
@@ -232,8 +234,9 @@ program define metafloat, eclass
 			label values b `sglab'
 		}
 		
-		// also save `study' variable label
+		// also save `study' and `subgroup' variable labels
 		local studylab : variable label `study'
+		local sgvarlab : variable label `subgroup'
 
 		if `"`saving'"'!=`""' | `"`clear'"'!=`""' {
 			
@@ -242,7 +245,7 @@ program define metafloat, eclass
 			// in particular, generate `sortorder' to guarantee the original order can always be recovered
 			tempvar sortorder
 			gen int `sortorder' = _n
-			
+
 			tempfile main_effects
 			qui save `main_effects'
 		}	
@@ -303,7 +306,8 @@ program define metafloat, eclass
 		}	
 
 		label variable `study' `"`studylab'"'
-		label variable y_cons `"`subgroup'"'
+		label variable y_cons `"`sgvarlab'"'
+		char define y_cons[SubgroupUnab] `"`subgroup'"'	// unabbreviated variable name stored in `subgroup'
 
 		// N.B. regress ... [iw], mse1  is equivalent to using -vwls- 
 		//  but -regress, mse1- appears to be faster for some reason
@@ -988,8 +992,9 @@ program define SavingClear
 	// identify y-vars and S-vars relating to the reference subgroup
 	qui ds *_cons*
 	local vlist `"`r(varlist)'"'
-	local subgroup : variable label y_cons		// original, full name of `subgroup' (stored earlier)
-
+	local subgroup : char y_cons[SubgroupUnab]		// original, full name of `subgroup' (stored earlier)
+	local sgvarlab : variable label y_cons			// original variable label of `subgroup' (stored earlier)
+	
 	// identify "abbreviated" form of `subgroup' used by -xi-
 	// from xi.ado:
 	// local name = substr("`pre'`base'",1,11) + "_"
@@ -1075,6 +1080,7 @@ program define SavingClear
 		label values `subgroup' `sglab'
 		label values b
 	}
+	label variable `subgroup' `"`sgvarlab'"'
 	
 	// add in pooled estimates -- these are not study-specific (obviously!) so `sortorder' does not matter
 	tempvar pooled
