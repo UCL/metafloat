@@ -1,0 +1,3 @@
+v 3
+d David Fisher, MRC Clinical Trials Unit at UCL, London, UK
+p metafloat: Estimation of covariate interactions and subgroup-specific treatment effects in meta-analysis.

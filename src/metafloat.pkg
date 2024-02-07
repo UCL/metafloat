@@ -1,0 +1,26 @@
+v 3
+d {bf:metafloat: Estimation of covariate interactions and subgroup-specific treatment effects in meta-analysis.}
+d
+d Meta-analysis is a statistical technique for combining results from
+d multiple independent studies, with the aim of estimating a single
+d overall effect. However, it can also be used for assessing how
+d treatment effects vary across participant subgroups. Ideally, this
+d assessment will be based on treatment-covariate interaction effects
+d derived within each trial separately, so that the pooled effects
+d are free from aggregation bias. In particular, metafloat provides a
+d simple way of estimating pooled interactions and "floating"
+d subgroup-specific treatment effects from a set of observed
+d (published, or otherwise pre-aggregated) treatment effects by trial
+d and by subgroup. For more information on the underlying methodology,
+d see Godolphin et al (2023), https://doi.org/10.1002/jrsm.1590.
+d
+d Requires: Stata version 11
+d
+d Distribution-Date: 20230830
+d
+d Author: David Fisher, MRC Clinical Trials Unit at UCL
+d Support: email d.fisher@ucl.ac.uk
+d Co-authors: Peter Godolphin, Ian White
+
+f metafloat.ado
+f metafloat.sthlp
