@@ -82,12 +82,12 @@ label variable counts1 `""Tocilizumab" "n/N""'
 
 forestplot, prefix(_y) labels(_LABELS) or nowt lcols(counts0 counts1) keepall ///
 	favours("Favours tocilizumab" " " # "Favours usual care" " ") ///
-	xlabel(.125 "0.125" 1 8) range(.125 8) cirange(.2 8) boxsca(50) texts(150) astext(50) savedims(A) graphregion(color(white)) name(left)
+	xlabel(.125 "0.125" 1 8) range(.125 8) cirange(.2 8) boxsca(50) texts(150) astext(50) savedims(A) graphregion(color(white)) scheme(s2color) name(left)
 
 forestplot, prefix(_yInt) interaction usedims(A) nonames eform effect("Interact. Odds Ratio") keepall nowt ///
 	favours("Favours greater effect of tocilizumab" "with corticosteroids" ///
 	# "Favours greater effect of tocilizumab" "without corticosteroids", fp(8)) ///
-	xlabel(.125 "0.125" 1 8) range(.125 8) cirange(.2 8) texts(150) graphregion(color(white)) name(right)
+	xlabel(.125 "0.125" 1 8) range(.125 8) cirange(.2 8) texts(150) graphregion(color(white)) scheme(s2color) name(right)
 
-graph combine left right, imargin(zero) xsize(4.5) graphregion(color(white))
+graph combine left right, imargin(zero) xsize(4.5) graphregion(color(white)) scheme(s2color)
 ```
