@@ -7,7 +7,8 @@
 
 Meta-analysis is a statistical technique for combining results from multiple independent studies, with the aim of estimating a single overall effect. However, it can also be used for assessing how treatment effects vary across participant subgroups. Ideally, this assessment will be based on treatment-covariate interaction effects derived _within each trial separately_, so that the pooled effects are free from aggregation bias. In particular, `metafloat` provides a simple way of estimating pooled interactions and "floating" subgroup-specific treatment effects from a set of observed (published, or otherwise pre-aggregated) treatment effects by trial and by subgroup.
 
-See [Godolphin et al (2023)](https://doi.org/10.1002/jrsm.1590) for more information on the underlying methodology.
+See [Godolphin et al (2023)](https://doi.org/10.1002/jrsm.1590) for more information on the underlying methodology. The lead author, Dr Godolphin, also gave a [Cochrane webinar](https://training.cochrane.org/resource/estimating-interactions-and-subgroup-effects-in-aggregate-data-meta-analysis) on the methodology in January 2024.
+
 
 # Installation
 
