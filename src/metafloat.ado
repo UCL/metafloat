@@ -12,7 +12,8 @@
 *  v0.12 beta  David Fisher 15feb2022
 *  v0.13 beta  David Fisher 05apr2022
 *  v0.14 beta  David Fisher 07jul2022
-*! v0.15 beta  David Fisher 30aug2023
+*  v0.15 beta  David Fisher 30aug2023
+*! v0.16 beta  David Fisher 18apr2024
 
 
 *** METAFLOAT ***
@@ -40,7 +41,8 @@
 // v0.12: improved handling of `design'; floating subgroups are now presented with reference to a particular "design" (i.e. available data in a particular set of subgroups)
 // v0.13: fully compatible with Stata's -estimates- protocol
 // v0.14: string-valued study() variables automatically converted to numeric, to avoid errors in -mvmeta_make-
-// v0.15: fixed minor bug which meant variable label of "subgroup" was lost (and hence not displayed in forest plot)
+// v0.15: fixed bug which meant variable label of "subgroup" was lost (and hence not displayed in forest plot)
+// v0.16: fixed bug related to Stata <16, where e(V)[1,1] is invalid syntax (see help whatsnew15to16)
 
 // TO DO:
 // debugging/test script
@@ -333,18 +335,21 @@ program define metafloat, eclass
 		local p_int = r(p)
 
 		local k1 = `k' - 1
-		matrix define `VarGammaHat' = e(V)[1..`k1', 1..`k1']
-		matrix define `GammaHat'    = e(b)[1,       1..`k1']
+		tempname eb
+		matrix define `VarGammaHat' = e(V)
+		matrix define `VarGammaHat' = `VarGammaHat'[1..`k1', 1..`k1']
+		matrix define `eb' = e(b)
+		matrix define `GammaHat'    = `eb'[1, 1..`k1']
 		matrix define `SigmaGamma'  = e(Sigma)	
 		
 		// extract cholesky matrix of Sigma
 		if `"`structure'"'=="unstructured" {
 			// special case: if `unstructured', -mvmeta- outputs the elements of `Chol' as part of e(b)
 			// so don't bother packing them up into a matrix; we're only going to unpack them again later		
-			matrix define `Chol' = e(b)[1, `k'...]
+			matrix define `Chol' = `eb'[1, `k'...]
 		}
 		else if inlist(`"`structure'"', "exchangeable", "wscorrzero") {
-			local tau = e(b)[1, `k']
+			local tau = `eb'[1, `k']
 			cholesky2 `SigmaGamma' `Chol'
 			matrix define `Chol' = sign(`tau') * `Chol'
 		}
@@ -385,8 +390,10 @@ program define metafloat, eclass
 			local p_trend = r(p)
 			
 			if `"`forcetrend'"'!=`""' {
-				matrix define `VarGammaHat' = e(V)[1, 1]		// Gamma is a constant if `trend'
-				matrix define `GammaHat'    = e(b)[1, 1]
+				matrix define `eb' = e(b)
+				matrix define `VarGammaHat' = e(V)
+				matrix define `VarGammaHat' = `VarGammaHat'[1, 1]		// Gamma is a constant if `trend'
+				matrix define `GammaHat'    = `eb'[1, 1]
 				matrix define `SigmaGamma'  = e(Sigma)
 
 				matrix define `VarGammaHat' = `VarGammaHat'*`d'*`d''
@@ -396,7 +403,7 @@ program define metafloat, eclass
 					matrix define `Chol' = J(`k1', `k1', 0)
 				}
 				else if `"`structure'"'!="fixed" {
-					local tau = e(b)[1, 2]
+					local tau = `eb'[1, 2]
 					cholesky2 `SigmaGamma' `Chol'
 					matrix define `Chol' = sign(`tau') * `Chol'
 				}
@@ -482,7 +489,8 @@ program define metafloat, eclass
 		
 		// Compute implied means for beta
 		tempname ThetaHat BetaHat
-		matrix define `ThetaHat' = e(b)[1,1]
+		matrix define `ThetaHat' = e(b)
+		matrix define `ThetaHat' = `ThetaHat'[1,1]
 		matrix define `BetaHat' = `ones'*`ThetaHat' + `Z'*`GammaHat''
 		
 		// First, derive `VarThetaHat' ignoring the uncertainty in the heterogeneity matrix
@@ -523,7 +531,8 @@ program define metafloat, eclass
 			
 		// ... and now correct VarThetaHat for uncertainty in the heterogeneity matrix if requested
 		if `"`uncertainv'"'==`""' {
-			matrix define `VarThetaHat' = e(V)[1,1]
+			matrix define `VarThetaHat' = e(V)
+			matrix define `VarThetaHat' = `VarThetaHat'[1,1]
 		}
 			
 		// correct variance for beta
