@@ -30,7 +30,7 @@ Data originally presented in Supplement 2, page 14, of [Shankar-Hari et al. (202
 
 Note that this same example is used to demonstrate the `metan` and `forestplot` commands within the [metan GitHub pages](https://github.com/UCL/metan/main/Examples/Example5.md), but without using `metafloat` directly (and without generating subgroup-specific treatment effects free from aggregation bias). It may be seen that far more lines of code are needed.
 
-To run this example in full, the `forestplot` command is required.  This command is part of the `metan` package, which may be installed by typing:
+To run this example in full, the `forestplot` command is required.  This command is part of the `metan` [package](https://github.com/UCL/metan), which may be installed by typing:
 
     . net describe metan, from("https://raw.githubusercontent.com/UCL/metan/master/src/")
 
