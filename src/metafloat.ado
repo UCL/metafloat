@@ -13,7 +13,9 @@
 *  v0.13 beta  David Fisher 05apr2022
 *  v0.14 beta  David Fisher 07jul2022
 *  v0.15 beta  David Fisher 30aug2023
-*! v0.16 beta  David Fisher 18apr2024
+*  v0.16 beta  David Fisher 18apr2024
+*  v0.17 beta  David Fisher 06sep2024
+*! v0.18 beta  David Fisher 24nov2025
 
 
 *** METAFLOAT ***
@@ -43,6 +45,8 @@
 // v0.14: string-valued study() variables automatically converted to numeric, to avoid errors in -mvmeta_make-
 // v0.15: fixed bug which meant variable label of "subgroup" was lost (and hence not displayed in forest plot)
 // v0.16: fixed bug related to Stata <16, where e(V)[1,1] is invalid syntax (see help whatsnew15to16)
+// v0.17: fixed bug whereby data stored in keepvars() would be lost for observations where effect was unable to be estimated (e.g. zero counts)
+// v0.18: added covariances() option, in case subgroup estimates are not independent
 
 // TO DO:
 // debugging/test script
@@ -52,6 +56,11 @@
 * Syntax:
 // metafloat ES seES [if] [in], study(varname) subgroup(varname) [ options ]
 // where ES, seES, study() and subgroup() are all required
+
+* Observed study-level covariances between subgroups
+// covariances(varlist)
+// where, for 2 subgroups, covariances(cov12) is the covariance between subgroups 1 and 2
+// for 3 subgroups, covariances(cov12 cov13 cov23)... and so on
 
 * Heterogeneity covariance structures:
 // fixed = all fixed (common) effects
@@ -112,20 +121,24 @@ program define metafloat, eclass
 		// but currently no easy way to test for this
 
 		syntax varlist(numeric min=2 max=2) [if] [in], STUDY(varname) SUBGROUP(varname) ///
-			[ SHOWmodels DESign DESignref(passthru) AUGVARiance(real 1e5) MTOL(real 1e-5) noTRend FORCEtrend noMATDROP ///
+			[ SORTBY(varlist) SHOWmodels DESign DESignref(passthru) AUGVARiance(real 1e5) MTOL(real 1e-5) noTRend FORCEtrend noMATDROP ///
 			  LISTConstraints noUNCertainv PRINT(string) ///		/* -mvmeta- options */
-			  SAVING(passthru) CLEAR KEEPVars(varlist) * ]
+			  SAVING(passthru) CLEAR KEEPVars(varlist) COVARiances(varlist) * ]
 		
 		_get_eformopts, eformopts(`options') allowed(__all__) soptions
 		local eformopt eform(`"`s(str)'"')
 		local soptions `"`s(options)'"'
-		marksample touse
 
 		
 		** Preserve data, prior to editing
+		marksample touse, novarlist				// Sep 2024: novarlist in case missing eff or stderr BUT important data stored in keepvars()
+		tempvar touse_fillin
+		qui gen byte `touse_fillin' = `touse'
+		markout `touse_fillin' `varlist'
+												 
 		preserve
 		qui keep if `touse' & !missing(`study', `subgroup')
-		keep `varlist' `study' `subgroup' `keepvars'
+		keep `touse_fillin' `varlist' `study' `subgroup' `sortby' `keepvars' `covariances'
 			
 		tokenize `varlist'
 		args eff stderr
@@ -159,16 +172,29 @@ program define metafloat, eclass
 			if `"`V'"'!=`"V"' {
 				qui rename `V' V
 			}
+		}
+		if _rc {
+			nois disp as err `"Something that should be true of your data is not"'
+			nois disp as err `"In particular, variables other than {it:ES}, {it:seES} cannot be named {bf:b} or {bf:V}"'
+			if `"`keepvars'"'!=`""' {
+				nois disp as err _n `", including any variables in the {bf:keepvars()} option)"'
+			}
+			exit 459
+		}		
 		
-			// augment if missing subgroup data
-			qui fillin `study' `subgroup'
-			assert _fillin == missing(b)
+		// augment if missing subgroup data
+		capture {
+			fillin `study' `subgroup'
+			assert _fillin == missing(b) if `touse_fillin'
+			assert missing(b) if !`touse_fillin'
+			replace _fillin = 1 if !`touse_fillin'
+			assert `"`: list covariances & keepvars'"'==`""'
 		}
 		if _rc {
 			nois disp as err `"Something that should be true of your data is not"'
 			nois disp as err `"In particular, variables {it:ES}, {it:seES}, {bf:study()} and {bf:subgroup()} must all be distinct"'
-			if `"`keepvars'"'!=`""' {
-				nois disp as err `"as should any variables in the {bf:keepvars()} option)"'
+			if `"`keepvars'`covariances'"'!=`""' {
+				nois disp as err _n `"as should any variables in the {bf:keepvars()} or {bf:covariances()} options)"'
 			}
 			exit 459
 		}
@@ -176,7 +202,7 @@ program define metafloat, eclass
 		// if any observed variances are larger than `augvariance'
 		//  (e.g. if estimated from very small sample)
 		// set to _fillin==2
-		qui replace _fillin = 2 if V > `augvariance'
+		qui replace _fillin = 2 if V > `augvariance' & !missing(V)
 
 		summ _fillin, meanonly
 		if r(max) {
@@ -207,7 +233,8 @@ program define metafloat, eclass
 		local designref
 		if `"`s(designref)'"'!=`""' {
 			local designref `"`s(designref)'"'
-			local collapse_opt collapse((firstnm) _Design)
+			local cvars _Design
+			// local collapse_opt collapse((firstnm) _Design)
 			// ^^ only needed for `design'; user-specified vars in keepvars() will be kept anyway via `main_effects'
 		}
 		
@@ -246,6 +273,7 @@ program define metafloat, eclass
 			// therefore we will need to be careful when merging (see -SavingClear- )
 			// in particular, generate `sortorder' to guarantee the original order can always be recovered
 			tempvar sortorder
+			sort `sortby' `study' `subgroup'
 			gen int `sortorder' = _n
 
 			tempfile main_effects
@@ -298,8 +326,14 @@ program define metafloat, eclass
 			matrix drop `matexist'
 		}
 
+		// NEW Nov 2025
+		if `"`covariances'"'!=`""' local cvars `cvars' `covariances'
+		if `"`cvars'"'!=`""' local collapse_opt collapse((firstnm) `cvars')
 		
-		** Generate -mvmeta- dataset containing contrasts plus constant (reference subgroup)	
+		
+		** Generate -mvmeta- dataset containing contrasts plus constant (reference subgroup)
+		// N.B. regress ... [iw], mse1  is equivalent to using -vwls- 
+		//  but -regress, mse1- appears to be faster for some reason
 		qui mvmeta_make regress b `usevars' [iw=V^-1], mse1 by(`study') keepmat clear nodetails useconstant `collapse_opt'
 		cap confirm numeric variable `Jyvars' y_cons
 		if _rc {
@@ -311,9 +345,82 @@ program define metafloat, eclass
 		label variable y_cons `"`sgvarlab'"'
 		char define y_cons[SubgroupUnab] `"`subgroup'"'	// unabbreviated variable name stored in `subgroup'
 
-		// N.B. regress ... [iw], mse1  is equivalent to using -vwls- 
-		//  but -regress, mse1- appears to be faster for some reason
+		// NEW Nov 2025
+		if `"`covariances'"'!=`""' {
+			local rc = 0
 
+			// Step 1: k-1 contrasts with reference
+			// (diagonal elements, under this transformation)
+			local covarlist : copy local covariances
+			foreach x of local usevars {
+				gettoken newcov covarlist : covarlist
+				cap confirm numeric variable `newcov'
+				local rc = _rc
+				
+				qui count if missing(`newcov')
+				if r(N) {
+					nois disp "The following observations have missing covariance values, which will be set to zero"
+					nois list `study' if missing(`newcov')
+					qui replace `newcov' = 0 if missing(`newcov')
+				}
+				
+				qui replace S`x'`x' = S`x'`x' - 2*`newcov'
+				
+				forvalues j = 1 / `=_N' {
+					local jj = `study'[`j']		// this should always be numeric, and should match the naming of S
+					local el = rownumb(S`jj', "`x'")
+					mat S`jj'[`el', `el'] = S`jj'[`el', `el'] - 2*`newcov'[`j']
+				}
+			}
+			cap assert `"`covarlist'"'==`""'
+			if _rc | `rc' {
+				nois disp as err "Error: option {bf:covariances()} contains incorrect number of variables"
+				exit 198
+			}
+			
+			// Step 2: k-1 covariances with reference
+			// (first column of var-covar matrix, under this transformation)
+			local covars_cons
+			local covarlist : copy local covariances
+			foreach x of local usevars {
+				gettoken newcov covarlist : covarlist
+				local covars_cons `covars_cons' `newcov'
+				
+				qui replace S`x'_cons = S`x'_cons + `newcov'
+				forvalues j = 1 / `=_N' {
+					local jj = `study'[`j']		// this should always be numeric, and should match the naming of S
+					local el = rownumb(S`jj', "`x'")
+					local cns = rownumb(S`jj', "_cons")
+					mat S`jj'[`el', `cns'] = S`jj'[`el', `cns'] + `newcov'[`j']
+					mat S`jj'[`cns', `el'] = S`jj'[`cns', `el'] + `newcov'[`j']
+				}
+			}
+
+			// Step 3: remaining off-diagonal elements (only if >2 subgroups)
+			local xx = 0
+			foreach x of local usevars {
+				local ++xx
+				local yy = 0
+				foreach y of local usevars {
+					local ++yy
+					if `xx' < `yy' {
+						gettoken newcov covarlist : covarlist
+						local covar_cons_x : word `xx' of `covars_cons'
+						local covar_cons_y : word `yy' of `covars_cons' 
+						cap replace S`x'`y' = S`x'`y' + `newcov' - `covar_cons_x' - `covar_cons_y'
+						
+						forvalues j = 1 / `=_N' {
+							local jj = `study'[`j']		// this should always be numeric, and should match the naming of S
+							local row = rownumb(S`jj', "`x'")
+							local col = rownumb(S`jj', "`y'")
+							mat S`jj'[`row', `col'] = S`jj'[`row', `col'] + `newcov'[`j'] - `covar_cons_x'[`j'] - `covar_cons_y'[`j']
+							mat S`jj'[`col', `row'] = S`jj'[`col', `row'] + `newcov'[`j'] - `covar_cons_x'[`j'] - `covar_cons_y'[`j']
+						}
+					}
+				}
+			}
+		}
+		
 		
 		** STEP 1: ESTIMATE INTERACTION (MEAN AND BS VARIANCE)
 		if `"`designref'"'!=`""' local showmodels showmodels
@@ -484,7 +591,7 @@ program define metafloat, eclass
 		matrix define `ones' = J(`k', 1, 1)			// column vector of ones, of length k
 		matrix define `onesJ' = J(`k', `k', 1)		// k by k matrix full of ones
 		matrix define `Z' = J(`k', `k1', 0)
-		matrix define `Z'[2, 1] = I(`k1')	
+		matrix define `Z'[2, 1] = I(`k1')
 		matrix define `L' = `Z', `ones'
 		
 		// Compute implied means for beta
@@ -899,25 +1006,25 @@ end
 
 	
 program define cholesky2
-* produce an approximate cholesky decomposition, even if matrix is not positive definite
-* (Note: taken from -mvmeta- by Ian White)
-args M C
-cap matrix `C' = cholesky(`M')
-if _rc {
-    local eps = trace(`M')/1000
-    if `eps'<=0 {
-        di as error "cholesky2: matrix `M' has non-positive trace"
-        matrix list `M'
-        exit 498
-    }
-    local p = rowsof(`M')
-    cap matrix `C' = cholesky(`M'+`eps'*I(`p'))
-    if _rc {
-        di as error "cholesky2: can't decompose matrix `M'"
-        matrix list `M'
-        exit 498
-    }
-}
+	* produce an approximate cholesky decomposition, even if matrix is not positive definite
+	* (Note: taken from -mvmeta- by Ian White)
+	args M C
+	cap matrix `C' = cholesky(`M')
+	if _rc {
+		local eps = trace(`M')/1000
+		if `eps'<=0 {
+			di as error "cholesky2: matrix `M' has non-positive trace"
+			matrix list `M'
+			exit 498
+		}
+		local p = rowsof(`M')
+		cap matrix `C' = cholesky(`M'+`eps'*I(`p'))
+		if _rc {
+			di as error "cholesky2: can't decompose matrix `M'"
+			matrix list `M'
+			exit 498
+		}
+	}
 end
 
 
@@ -1144,14 +1251,26 @@ program define SavingClear
 	qui ds `study' `subgroup' b V stderr, not
 	local lcolvars `"`r(varlist)'"'
 	
-	qui metan b stderr, nograph nohet nosubgroup nooverall keeporder ///
-		study(`subgroup') by(`study') rcols(`lcolvars') ///
-		clear prefix(_y)
+	tempvar sgstr
+	qui decode `study', gen(`sgstr')
+	if `"`: variable label `study''"'!=`""' {
+		label variable `sgstr' `"`: variable label `study''"'
+	}
+	else label variable `sgstr' Subgroup
+	qui replace `sgstr' = "Pooled" if `pooled'==1
 
-	qui drop *_EFFECT
-	qui rename _y_BY _BY
-	qui rename _y_STUDY _STUDY
-	qui rename _y_LABELS _LABELS
+	qui metan b stderr, nograph nohet nosubgroup nooverall keeporder ///
+		study(`subgroup') by(`sgstr') lcols(`study') rcols(`lcolvars') ///
+		clear prefix(_y)
+	
+	qui {
+		drop *_EFFECT
+		drop _y_BY
+		rename _y_STUDY _STUDY
+		rename _y_LABELS _LABELS
+		rename `study' _BY
+		order _BY, before(_STUDY)
+	}
 
 	summ _BY if `pooled'==1, meanonly
 	qui replace `pooled' = (_BY==`r(min)')
