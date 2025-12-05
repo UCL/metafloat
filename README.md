@@ -1,7 +1,7 @@
 <a href ="https://www.mrcctu.ucl.ac.uk/"><img src="logo_ukri-mrc-ctu_transparent-background.png" width="50%" /></a>
 
 # metafloat
- v0.15  30aug2023
+ v0.18  24nov2025
 
 # A Stata package to estimate covariate interactions and subgroup-specific treatment effects in meta-analysis
 
